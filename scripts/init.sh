@@ -235,7 +235,7 @@ chmod 600 "$env_file"
 # 只接收初始化拥有的输入，不把宿主全部环境或开发配置复制进新部署。
 for name in SILICONFLOW_API_KEY WEB_SEARCH_PROVIDER DOUBAO_SEARCH_API_KEY TAVILY_API_KEY DEEPSEEK_API_KEY \
     JWT_SECRET_KEY API_KEY_DERIVATION_SECRET YUXI_INSTANCE_ID YUXI_ENV \
-    POSTGRES_PASSWORD NEO4J_PASSWORD MINIO_ACCESS_KEY MINIO_SECRET_KEY \
+    POSTGRES_PASSWORD NEBULA_PASSWORD MINIO_ACCESS_KEY MINIO_SECRET_KEY \
     CUBE_API_URL CUBE_API_KEY CUBE_PROXY_NODE_IP CUBE_PROXY_PORT_HTTP CUBE_TEMPLATE_ID \
     CUBE_NODE_USER_DATA_DIR CUBE_NODE_SKILL_PROJECTION_DIR \
     SANDBOX_BACKEND SANDBOX_RUNNER_TOKEN SANDBOX_RUNNER_URL SANDBOX_CONTAINER_IMAGE \
@@ -294,7 +294,7 @@ fi
 
 if [ "$(get_env_value YUXI_ENV)" = production ]; then
     compose_file=docker-compose.prod.yml
-    for name in POSTGRES_PASSWORD NEO4J_PASSWORD MINIO_ACCESS_KEY MINIO_SECRET_KEY; do
+    for name in POSTGRES_PASSWORD NEBULA_PASSWORD MINIO_ACCESS_KEY MINIO_SECRET_KEY; do
         if [ -z "$(get_env_value "$name")" ]; then
             set_env_value "$name" "$(generate_hex 32)"
         fi
@@ -333,7 +333,9 @@ images=(
     "node:24-slim"
     "node:22-alpine"
     "milvusdb/milvus:v3.0.2"
-    "neo4j:5.26.29"
+    "vesoft/nebula-metad:v3.8.0"
+    "vesoft/nebula-storaged:v3.8.0"
+    "vesoft/nebula-graphd:v3.8.0"
     "ghcr.io/astral-sh/uv:0.12.6"
     "nginx:alpine"
     "quay.io/coreos/etcd:v3.5.25"

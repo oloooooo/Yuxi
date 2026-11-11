@@ -94,12 +94,12 @@ async def shutdown_component(name: str, operation: Callable[[], object]) -> None
         logger.error(f"Shutdown component failed: component={name}, type={type(exc).__name__}")
 
 
-def close_neo4j_connection() -> object:
+def close_nebula_connection() -> object:
     """关闭共享图数据库连接。"""
 
-    from yuxi.infrastructure.neo4j import close_shared_neo4j_connection
+    from yuxi.infrastructure.nebula import close_shared_nebula_connection
 
-    return close_shared_neo4j_connection()
+    return close_shared_nebula_connection()
 
 
 async def _initialize_startup_component(app: FastAPI, *, name: str, required: bool, operation: Callable[[], object]) -> None:

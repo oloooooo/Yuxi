@@ -1,4 +1,4 @@
-"""按文件读取图谱的真实 PostgreSQL、Neo4j 与 HTTP 契约。"""
+"""按文件读取图谱的真实 PostgreSQL、图库与 HTTP 契约。"""
 
 import asyncio
 import os
@@ -14,11 +14,11 @@ from sqlalchemy import insert, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from test.integration.graphs.nebula_graph import drop_kb
 from test.integration.support.postgres_schema import create_isolated_manager, drop_isolated_schema, scoped_manager
 from yuxi.api.dependencies.knowledge import require_knowledge_base_read
 from yuxi.api.errors import domain_error_handler
 from yuxi.api.routers.knowledge import graphs as router
-from yuxi.infrastructure.neo4j import safe_neo4j_label
 from yuxi.migrations.schema import create_knowledge_tables
 from yuxi.modules.knowledge.graphs import service as graph_service
 from yuxi.modules.knowledge.graphs.extractors import normalize_extraction_result
@@ -43,7 +43,6 @@ async def test_file_subgraph_scopes_mentions_before_limit_and_rejects_other_file
     query_manager = scoped_manager(query_engine)
     query_manager.AsyncSession = async_sessionmaker(query_engine, expire_on_commit=False)
     kb_id = f"pytest_file_graph_{uuid4().hex}"
-    label = safe_neo4j_label(kb_id)
     monkeypatch.setattr(graphs, "pg_manager", query_manager)
     monkeypatch.setattr(projections, "pg_manager", query_manager)
     service = KnowledgeGraphService(kb_id=kb_id)
@@ -175,20 +174,20 @@ async def test_file_subgraph_scopes_mentions_before_limit_and_rejects_other_file
             response = await client.get("/api/graph/subgraph", params={"kb_id": kb_id, "file_id": "a"})
             assert response.status_code == 500
             monkeypatch.setattr(service.graph_repo, "file_graph_snapshot", snapshot)
-            neo_query = graph_service.run_neo4j_query_io
-            monkeypatch.setattr(graph_service, "run_neo4j_query_io", AsyncMock(side_effect=RuntimeError("Neo4j unavailable")))
+            graph_query = graph_service.run_nebula_query_io
+            monkeypatch.setattr(graph_service, "run_nebula_query_io", AsyncMock(side_effect=RuntimeError("图库不可用")))
             response = await client.get("/api/graph/subgraph", params={"kb_id": kb_id, "file_id": "a"})
             assert response.status_code == 500
 
-            # 两个请求共享单连接池；首个请求到达 Neo4j 前已取得全部 PG 锁。
+            # 两个请求共享单连接池；首个请求到达图库前已取得全部 PG 锁。
             pool_started, pool_release = asyncio.Event(), asyncio.Event()
 
             async def held_pool_query(*args):
                 pool_started.set()
                 await pool_release.wait()
-                return await neo_query(*args)
+                return await graph_query(*args)
 
-            monkeypatch.setattr(graph_service, "run_neo4j_query_io", held_pool_query)
+            monkeypatch.setattr(graph_service, "run_nebula_query_io", held_pool_query)
             first = asyncio.create_task(client.get("/api/graph/subgraph", params={"kb_id": kb_id, "file_id": "a"}))
             second = None
             try:
@@ -204,9 +203,9 @@ async def test_file_subgraph_scopes_mentions_before_limit_and_rejects_other_file
             async def held_query(*args):
                 started.set()
                 await release.wait()
-                return await neo_query(*args)
+                return await graph_query(*args)
 
-            monkeypatch.setattr(graph_service, "run_neo4j_query_io", held_query)
+            monkeypatch.setattr(graph_service, "run_nebula_query_io", held_query)
             query_task = asyncio.create_task(client.get("/api/graph/subgraph", params={"kb_id": kb_id, "file_id": "a"}))
             try:
                 await asyncio.wait_for(started.wait(), timeout=5)
@@ -233,7 +232,6 @@ async def test_file_subgraph_scopes_mentions_before_limit_and_rejects_other_file
             assert "source_chunk_id" not in shared["properties"]
 
     finally:
-        with service.driver.session() as session:
-            session.run(f"MATCH (n:MilvusKB:`{label}`) DETACH DELETE n").consume()
+        drop_kb(get_shared_nebula_connection(), kb_id)
         await query_engine.dispose()
         await drop_isolated_schema(schema, admin, engine)

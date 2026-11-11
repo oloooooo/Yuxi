@@ -603,14 +603,13 @@ async def test_graph_status_reports_latest_successful_run_as_completed():
 
 
 def test_milvus_graph_service_writes_chunk_entity_and_relation():
-    tx = MagicMock()
-    session = MagicMock()
-    session.__enter__.return_value = session
-    session.execute_write.side_effect = lambda func: func(tx)
-    driver = MagicMock()
-    driver.session.return_value = session
-    connection = SimpleNamespace(driver=driver)
-    service = KnowledgeGraphService(neo4j_connection=connection)
+    statements: list[str] = []
+
+    def execute(ngql: str) -> list:
+        statements.append(ngql)
+        return []
+
+    service = KnowledgeGraphService(nebula_connection=SimpleNamespace(execute=execute))
     chunk = SimpleNamespace(
         chunk_id="chunk_1",
         file_id="file_1",
@@ -646,12 +645,13 @@ def test_milvus_graph_service_writes_chunk_entity_and_relation():
     assert [entity["name"] for entity in entities] == ["张三", "公司"]
     assert {entity["label"] for entity in entities} == {"Person", "Organization"}
     assert triples[0]["relation_type"] == "WORKS_AT"
-    queries = [call.args[0] for call in tx.run.call_args_list]
-    assert any("MERGE (c:Chunk:MilvusKB:`kb_test`" in query for query in queries)
-    assert any("MERGE (e:Entity:MilvusKB:`kb_test`" in query for query in queries)
-    assert any("MERGE (source)-[r:RELATION" in query for query in queries)
-    entity_call = next(call for call in tx.run.call_args_list if "MERGE (e:Entity" in call.args[0])
-    assert entity_call.kwargs["attributes"] == '[{"text": "工程师", "label": "Occupation"}]'
+    joined = "\n".join(statements)
+    assert 'UPSERT VERTEX ON Node "kb_test:chunk_1"' in joined
+    assert 'Node.kind = "Chunk"' in joined
+    assert joined.count('Node.kind = "Entity"') == 2
+    assert "INSERT EDGE MENTIONS" in joined
+    assert "INSERT EDGE RELATION" in joined
+    assert '[{"text": "工程师", "label": "Occupation"}]' in joined
 
 
 def test_graph_vector_store_uses_idempotent_upsert():

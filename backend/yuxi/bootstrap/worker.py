@@ -54,12 +54,12 @@ async def startup(ctx: dict) -> None:
 
     await invalidate_option_cache(system_options.key)
     if knowledge:
-        from yuxi.infrastructure.neo4j import get_shared_neo4j_connection
+        from yuxi.infrastructure.nebula import get_shared_nebula_connection
         from yuxi.modules.knowledge.runtime import knowledge_base
 
         # ARQ 消费与 pending 补发必须晚于后端就绪，启动失败保留持久任务意图。
         await knowledge_base.initialize()
-        await asyncio.to_thread(get_shared_neo4j_connection)
+        await asyncio.to_thread(get_shared_nebula_connection)
 
     await _reconcile_agent_runs_once()
     await reconcile_and_publish_jobs()
@@ -83,13 +83,13 @@ async def shutdown(ctx: dict) -> None:
             task.cancel()
         if reconciliation_tasks:
             await asyncio.gather(*reconciliation_tasks, return_exceptions=True)
-    from yuxi.infrastructure.neo4j import close_shared_neo4j_connection
+    from yuxi.infrastructure.nebula import close_shared_nebula_connection
     from yuxi.infrastructure.redis.queue import close_queue_clients
 
     # ARQ 在 on_shutdown 返回后关闭自己的消费池，单个清理失败不能中断该阶段。
     for component, close in (
         ("queue_clients", close_queue_clients),
-        ("neo4j", close_shared_neo4j_connection),
+        ("nebula", close_shared_nebula_connection),
         ("postgres", pg_manager.close),
     ):
         try:

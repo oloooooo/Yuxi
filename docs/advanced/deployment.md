@@ -11,7 +11,7 @@
 - 能访问所需镜像和模型服务的网络；
 - 使用本地 GPU OCR 时准备 NVIDIA Container Toolkit。
 
-生产 Compose 默认不把 PostgreSQL、MinIO、Neo4j 和 Milvus 管理端口发布到公网。维护这些服务时，优先使用 `docker compose exec` 或受控的内网入口。
+生产 Compose 默认不把 PostgreSQL、MinIO、Nebula 和 Milvus 管理端口发布到公网。维护这些服务时，优先使用 `docker compose exec` 或受控的内网入口。
 
 ::: danger 公网部署必须先配置 TLS
 生产 Compose 自带的 Web 容器只监听 HTTP 80 端口，不负责证书和 HTTPS。把服务交给公网或接收登录、OIDC、API Key 请求前，必须在前面配置 TLS 反向代理，并只把 HTTPS 地址提供给用户和外部系统。HTTP 仅适合本机或受控内网调试。
@@ -41,7 +41,7 @@ YUXI_INIT_NON_INTERACTIVE=1 ./scripts/init.sh
 
 Container 共享宿主内核，适用于单租户可信代码；生产必须固定镜像 digest。需要强隔离时显式设置 `SANDBOX_BACKEND=cube`，按[沙盒配置与运维](./sandbox-operations.md#原生执行节点)准备节点、模板和共享挂载，并配置 `CUBE_*` 连接与路径；Cube 启动命令去掉 `--profile container`。Docker 项目名只接受小写字母、数字、连字符和下划线，因此显示名称 `Production` 对应项目名 `production`。
 
-脚本接受环境变量覆盖，并生成缺失的 PostgreSQL、Neo4j、MinIO 凭据、两个独立应用安全密钥及 runner 认证密钥；已有非空安全密钥无效时明确失败，不自动轮换。重建时保留配置文件及原有密钥，避免用临时环境变量覆盖已有生产凭据。开关、优先级和模型 Key 输入见[常见配置](../intro/quick-start.md#常见配置)。
+脚本接受环境变量覆盖，并生成缺失的 PostgreSQL、Nebula、MinIO 凭据、两个独立应用安全密钥及 runner 认证密钥；已有非空安全密钥无效时明确失败，不自动轮换。重建时保留配置文件及原有密钥，避免用临时环境变量覆盖已有生产凭据。开关、优先级和模型 Key 输入见[常见配置](../intro/quick-start.md#常见配置)。
 
 也可以复制模板，手动编辑 `.env.prod` 并设置文件权限：
 
@@ -54,7 +54,7 @@ chmod 600 .env.prod
 
 ```dotenv
 POSTGRES_PASSWORD=<strong-postgres-password>
-NEO4J_PASSWORD=<strong-neo4j-password>
+NEBULA_PASSWORD=<strong-nebula-password>
 MINIO_ACCESS_KEY=<strong-minio-access-key>
 MINIO_SECRET_KEY=<strong-minio-secret-key>
 JWT_SECRET_KEY=<random-value-at-least-32-characters>
@@ -89,7 +89,7 @@ YUXI_ENV_FILE=.env.staging docker compose --env-file .env.staging -f docker-comp
 
 生产 Web 端口通过 `YUXI_FRONTEND_PORT` 设置，默认 80；API 默认发布到 `127.0.0.1:6050`，管理服务端口也只绑定回环地址。具体默认值由 `docker-compose.prod.yml` 的 `ports` 定义；多套生产环境还需分别设置端口，启用 `all` profile 时包括 `YUXI_MINERU_PORT`。开发环境的端口隔离示例见[并行工作树与隔离运行环境](../develop-guides/parallel-worktree-environments.md)。
 
-MinIO 将同一宿主数据目录挂载到容器 `/data`，Neo4j 将日志目录挂载到 `/logs`；这两个容器内路径的调整不要求移动宿主文件。
+MinIO 将同一宿主数据目录挂载到容器 `/data`，Nebula 的 metad/storaged 分别把数据目录挂载到 `/data/meta` 与 `/data/storage`；这些容器内路径的调整不要求移动宿主文件。
 
 ## 2. 首次启动
 
@@ -107,7 +107,7 @@ Compose 自动创建缺失的挂载目录，`storage-init` 在无网络、无平
 | `yuxi/threads`、`yuxi/skill-sources`、`yuxi/skill-projections` | `1000:1000` | `0700` |
 | `milvus/milvus`、`milvus/logs` | `999:999` | `0755` |
 
-以上路径均相对 `YUXI_STATE_DIR`。初始化可重复运行，仅调整五个目录本身；已有内部文件和目录的内容、数字属主与模式保持原值。恢复备份时保留原数字属主，历史内部权限错误由部署者离线处理。PostgreSQL、Redis、MinIO、Neo4j 继续遵循各自镜像的存储初始化契约。
+以上路径均相对 `YUXI_STATE_DIR`。初始化可重复运行，仅调整五个目录本身；已有内部文件和目录的内容、数字属主与模式保持原值。恢复备份时保留原数字属主，历史内部权限错误由部署者离线处理。PostgreSQL、Redis、MinIO、Nebula 继续遵循各自镜像的存储初始化契约。
 
 API、Web 与 MinIO 的项目文件在构建时明确权限：源码和配置归 root 持有，普通文件可读、目录可进入、入口脚本可执行；API 与 worker 仍以 `1000:1000` 运行，仅在专用数据与运行目录写入。构建输入的 `600/700` 模式不会使镜像内的项目文件失去可读性。开发 Compose 的源码 bind mount 使用宿主文件实际权限，宿主 checkout 仍须允许容器用户读取与遍历；镜像权限不会覆盖挂载内容。实现与回归入口见[权限决策](../develop-guides/decisions/implemented/2026-10-17-container-storage-permissions.md)。
 
@@ -127,7 +127,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml --profile contain
 docker compose --env-file .env.prod -f docker-compose.prod.yml --profile container -f docker-compose.no-knowledge.yml up -d --no-build
 ```
 
-开发环境使用 `docker compose --profile container -f docker-compose.yml -f docker-compose.no-knowledge.yml up -d`。关闭配置将 Milvus、etcd、Neo4j 的副本数设为 0，并为 API、worker 和初始化器设置 `YUXI_KNOWLEDGE_ENABLED=false`。同项目已有的三个容器也会停止，无需删除数据卷。切换前停止提交知识库任务，并等待正在执行的任务结束；意外中断的任务仍按已有租约恢复规则收敛，尚未执行的知识库任务和投影清理意图保留，重新开启后继续处理。
+开发环境使用 `docker compose --profile container -f docker-compose.yml -f docker-compose.no-knowledge.yml up -d`。关闭配置将 Milvus、etcd、Nebula 的副本数设为 0，并为 API、worker 和初始化器设置 `YUXI_KNOWLEDGE_ENABLED=false`。同项目已有的三个容器也会停止，无需删除数据卷。切换前停止提交知识库任务，并等待正在执行的任务结束；意外中断的任务仍按已有租约恢复规则收敛，尚未执行的知识库任务和投影清理意图保留，重新开启后继续处理。
 
 关闭时，API 不初始化知识库执行器，不注册知识库管理、图谱、评估、公开知识库与 `/api/mcp` 路由；这些路径返回 404。系统能力发现报告知识库不可用，Agent、MCP 配置和 Skill 定义仍保留。Agent 实际使用知识库工具时会报告 MCP 不可用，普通对话不依赖知识库后端。初始化器仍建立、校验原有两域 Schema 并同步内置内容，不清理知识库记录。
 
@@ -139,7 +139,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml --profile contain
 
 确认环境文件中的 `YUXI_KNOWLEDGE_ENABLED` 为 `true` 或未设置，然后检查就绪状态并检索已有文档。该开关不是热切换；修改后需要重新创建 API 和 worker。仅设置环境开关不会停止存储容器，停启本地容器应使用上面的 Compose 叠加配置。
 
-API 与 worker 必须共享持久化的 `JWT_SECRET_KEY` 和 `YUXI_INSTANCE_ID`，用于内部 MCP 短期用户委托。启用 Knowledge 时，两种进程在连接数据库前校验显式委托配置，不使用各进程临时生成的身份；worker 还会在派发知识任务前连接已有知识库后端与 Neo4j，因此完整部署必须启动 Milvus、etcd 和 Neo4j。Knowledge 是平台自有服务，容器内 MCP 地址固定为 `http://api:5050/api/mcp`，不提供环境变量覆盖；直接在宿主运行后端时无法访问该容器内地址，知识工具与引用读取需要在容器拓扑内执行。
+API 与 worker 必须共享持久化的 `JWT_SECRET_KEY` 和 `YUXI_INSTANCE_ID`，用于内部 MCP 短期用户委托。启用 Knowledge 时，两种进程在连接数据库前校验显式委托配置，不使用各进程临时生成的身份；worker 还会在派发知识任务前连接已有知识库后端与 NebulaGraph，因此完整部署必须启动 Milvus、etcd 和 Nebula。Knowledge 是平台自有服务，容器内 MCP 地址固定为 `http://api:5050/api/mcp`，不提供环境变量覆盖；直接在宿主运行后端时无法访问该容器内地址，知识工具与引用读取需要在容器拓扑内执行。
 
 ### 共享内容更新与失败重试
 
@@ -203,7 +203,7 @@ worker 的 Compose 健康检查通过 `python -m yuxi.workers.health` 轻量读�
 | 5050 | API | API 和 Swagger 文档 |
 | runner 8090（容器内网） | sandbox-runner | 默认 Container 执行，仅 API/worker 访问 |
 | Cube 私网控制面/代理 | 专用 Linux/KVM 节点 | 显式选择 Cube 时由部署提供 |
-| 7474 / 7687 | Neo4j | HTTP 管理界面 / Bolt |
+| 9669 | NebulaGraph | graphd 查询端口（nGQL） |
 | 9000 / 9001 | MinIO | 对象 API / 管理控制台 |
 | 19530 / 9091 | Milvus | gRPC / 健康检查 |
 | 5432 | PostgreSQL | 本机数据库维护 |
@@ -211,9 +211,9 @@ worker 的 Compose 健康检查通过 `python -m yuxi.workers.health` 轻量读�
 
 `all` profile 提供可选的 `mineru-api`（30001，4.1 Tasks 接口），不包含 PaddleX。etcd 只在 Compose 网络内供 Milvus 使用，没有发布到宿主机。
 
-PostgreSQL、Redis、MinIO、Milvus 和 Neo4j 的端口只绑定 `127.0.0.1`，不要把它们暴露到公网；Web 与 API 发布到所有接口。各端口可用环境变量覆盖（`YUXI_FRONTEND_PORT`、`YUXI_API_PORT`、`YUXI_NEO4J_HTTP_PORT`、`YUXI_MINIO_API_PORT`、`YUXI_MILVUS_PORT`、`YUXI_POSTGRES_PORT`、`YUXI_REDIS_PORT`），完整映射以 [docker-compose.yml](https://github.com/xerrors/Yuxi/blob/main/docker-compose.yml) 为准。
+PostgreSQL、Redis、MinIO、Milvus 和 Nebula 的端口只绑定 `127.0.0.1`，不要把它们暴露到公网；Web 与 API 发布到所有接口。各端口可用环境变量覆盖（`YUXI_FRONTEND_PORT`、`YUXI_API_PORT`、`YUXI_NEBULA_PORT`、`YUXI_MINIO_API_PORT`、`YUXI_MILVUS_PORT`、`YUXI_POSTGRES_PORT`、`YUXI_REDIS_PORT`），完整映射以 [docker-compose.yml](https://github.com/xerrors/Yuxi/blob/main/docker-compose.yml) 为准。
 
-常用入口：Web <http://localhost:5173>，API 文档 <http://localhost:5050/docs>，Neo4j <http://localhost:7474>。用户执行环境状态在“设置 → Agent 环境”查看；health 与 ready 接口的语义见上方「验证部署」。
+常用入口：Web <http://localhost:5173>，API 文档 <http://localhost:5050/docs>，NebulaGraph 查询端口 <127.0.0.1:9669>（用 `nebula-console` 等客户端连接）。用户执行环境状态在“设置 → Agent 环境”查看；health 与 ready 接口的语义见上方「验证部署」。
 
 ## 跨域（CORS）
 
@@ -266,10 +266,10 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml --profile contain
 
 ### 停机备份与恢复演练
 
-本节适用于同一版本、同一组组件版本的整套状态恢复。备份必须同时包含 PostgreSQL、MinIO、Milvus/etcd、Neo4j、Redis、用户 Workspace、Skills 来源及投影，并单独安全保存环境文件、两个应用安全密钥和镜像版本或 digest。Container 的 Home 与临时软件不跨 Run 保留。显式选择 Cube 时，应用目录不包含节点磁盘和 VM Home；需要保留用户安装的软件与配置时，按[沙盒运维](./sandbox-operations.md#运维与验证)另行备份节点，保留实例身份与原挂载路径。
+本节适用于同一版本、同一组组件版本的整套状态恢复。备份必须同时包含 PostgreSQL、MinIO、Milvus/etcd、Nebula、Redis、用户 Workspace、Skills 来源及投影，并单独安全保存环境文件、两个应用安全密钥和镜像版本或 digest。Container 的 Home 与临时软件不跨 Run 保留。显式选择 Cube 时，应用目录不包含节点磁盘和 VM Home；需要保留用户安装的软件与配置时，按[沙盒运维](./sandbox-operations.md#运维与验证)另行备份节点，保留实例身份与原挂载路径。
 
 1. 关闭外部入口，等待正在执行的 Run、待派发 Input、后台作业和沙盒命令收敛；暂停定时任务的触发来源。确认用户 VM 已空闲，按执行节点的停机规程保存节点状态。
-2. 停止 Web、API 和 worker，再停止全部本次部署的存储服务。不要复制仍在写入的 PostgreSQL、etcd、Neo4j 或对象目录。
+2. 停止 Web、API 和 worker，再停止全部本次部署的存储服务。不要复制仍在写入的 PostgreSQL、etcd、Nebula 或对象目录。
 3. 对配置中的实际状态目录执行冷备份，保留数字属主、文件模式、符号链接和必要的扩展属性；外置共享目录或符号链接目标必须独立纳入同一批备份。保留原数据与原环境文件。
 4. 把备份解到新的空目录，核对文件摘要与数字属主。恢复环境使用同一组安全密钥；所有 bind mount、节点共享路径和实例身份必须与恢复方案一致，不能让新旧实例同时写同一目录。
 5. 用相同镜像启动存储、`app-init`、API、worker 和 Web。核对 Schema、readiness、原用户登录、会话最终结果、反馈、知识文件正文与检索、原始对象字节、图谱及用户文件；再提交一条新对话，确认恢复后的写入链路可用。
@@ -296,7 +296,7 @@ sudo tar --numeric-owner --acls --xattrs -xpf "$BACKUP_DIR/state.tar" -C "$RESTO
 
 ### 轮换历史默认凭据
 
-更换 `.env.prod` 中的 PostgreSQL、Neo4j 或 MinIO 凭据，不会自动修改已经写入数据卷的服务凭据。请先使用对应服务的官方管理流程修改数据卷内的凭据，再更新 `.env.prod`，重新创建相关服务，并用旧凭据验证登录已被拒绝。不要把真实密码写进命令历史、日志或文档。
+更换 `.env.prod` 中的 PostgreSQL、Nebula 或 MinIO 凭据，不会自动修改已经写入数据卷的服务凭据。请先使用对应服务的官方管理流程修改数据卷内的凭据，再更新 `.env.prod`，重新创建相关服务，并用旧凭据验证登录已被拒绝。不要把真实密码写进命令历史、日志或文档。
 
 PostgreSQL 可以在数据库容器内使用交互式命令修改，避免新密码出现在 shell 历史和进程参数中：
 
@@ -305,7 +305,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml --profile contain
   exec postgres psql -U postgres -d yuxi -c '\password postgres'
 ```
 
-Neo4j 使用 `cypher-shell` 的当前用户密码修改流程；MinIO 使用 `mc admin` 或部署采用的密钥管理流程。完成轮换后，把新值写入 `.env.prod`，再重建依赖这些凭据的服务：
+Nebula 在 graphd 内用 `ALTER USER root WITH PASSWORD '<new>'` 修改内置账号密码（通过 `nebula-console` 连接 graphd 执行）；MinIO 使用 `mc admin` 或部署采用的密钥管理流程。完成轮换后，把新值写入 `.env.prod`，再重建依赖这些凭据的服务：
 
 ```bash
 docker compose --env-file .env.prod -f docker-compose.prod.yml --profile container \
@@ -338,7 +338,7 @@ Yuxi 本体使用 MIT License。Compose 依赖以独立进程运行，Yuxi 通�
 
 | 组件 | 镜像引用 | 许可证 |
 | --- | --- | --- |
-| Neo4j Community | `neo4j:5.26.29` | GPL-3.0-only |
+| NebulaGraph | `vesoft/nebula-graphd:v3.8.0`、`vesoft/nebula-metad:v3.8.0`、`vesoft/nebula-storaged:v3.8.0` | Apache-2.0 |
 | MinIO | 本地构建：`<项目名>-minio:RELEASE.2024-12-18T13-15-44Z`（`docker/minio/Dockerfile`；项目名取 `COMPOSE_PROJECT_NAME`，默认 `yuxi`） | AGPL-3.0 |
 | Milvus | `milvusdb/milvus:v3.0.2` | Apache-2.0 |
 | etcd | `quay.io/coreos/etcd:v3.5.25` | Apache-2.0 |
@@ -352,24 +352,4 @@ MinIO 的镜像由本仓库构建：MinIO 在 Docker Hub 与 quay.io 上的镜�
 
 如果通过 `docker/save_docker_images.sh` 或其他方式向第三方再分发包含 GPL/AGPL 软件的镜像，需要保留许可证文本和上游声明，并按对应许可证第 6 节提供匹配的完整对应源码或有效的书面源码要约。通过网络提供服务、修改 AGPL 组件或把组件集成进同一程序时，义务可能不同，不能只附一个上游链接就视为完成。
 
-商业部署可以评估 Neo4j Enterprise、MinIO 商业订阅或其他兼容替代品，但这会带来新的协议、迁移和运维条件。
-
-需要 Neo4j 企业版功能或商业支持时，用 Compose override 同时替换图谱服务镜像并注入许可确认；只把变量写进 `.env.prod` 不会生效，因为 `graph` 服务使用显式 `environment` 列表。请自行新建 `docker-compose.enterprise.yml`：
-
-```yaml
-services:
-  graph:
-    image: neo4j:5.26.29-enterprise
-    environment:
-      NEO4J_ACCEPT_LICENSE_AGREEMENT: "yes"
-```
-
-启动或重建图谱服务时合并该文件，并先验证合并后的配置可解析：
-
-```bash
-docker compose --env-file .env.prod -f docker-compose.prod.yml --profile container -f docker-compose.enterprise.yml config --quiet
-docker compose --env-file .env.prod -f docker-compose.prod.yml --profile container -f docker-compose.enterprise.yml up -d graph
-docker compose --env-file .env.prod -f docker-compose.prod.yml --profile container -f docker-compose.enterprise.yml logs --tail=100 graph
-```
-
-同时按 Neo4j 官方订阅协议确认许可范围；设置该变量表示部署方接受 Neo4j 商业许可，许可获取与合规由部署方负责。替换镜像不会自动迁移或改变现有数据卷。以上是工程侧边界，不构成法律意见；再分发、修改组件或对外托管前请让法务按具体版本和交付方式确认。
+图谱服务使用 Apache-2.0 的 NebulaGraph，没有需要注入许可确认的商业镜像入口。需要商业支持或托管订阅时，请联系各组件厂商；更换镜像不会自动迁移或改变现有数据卷。以上是工程侧边界，不构成法律意见；再分发、修改组件或对外托管前请让法务按具体版本和交付方式确认。

@@ -1,6 +1,6 @@
 # 知识库机制
 
-本页说明文档怎样从上传走到可检索状态，以及 PostgreSQL、MinIO、Milvus、Neo4j、后台作业 和 Agent 工具各自负责什么。第一次操作知识库请看[创建并使用知识库](../intro/knowledge-base.md)，解析器配置见[文档处理与 OCR](../advanced/document-processing.md)。
+本页说明文档怎样从上传走到可检索状态，以及 PostgreSQL、MinIO、Milvus、NebulaGraph、后台作业 和 Agent 工具各自负责什么。第一次操作知识库请看[创建并使用知识库](../intro/knowledge-base.md)，解析器配置见[文档处理与 OCR](../advanced/document-processing.md)。
 
 ## 能力边界
 
@@ -39,7 +39,7 @@ flowchart LR
     MilvusKB --> PG[("PostgreSQL")]
     MilvusKB --> Object[("MinIO")]
     MilvusKB --> Vector[("Milvus")]
-    MilvusKB --> Graph[("Neo4j，图谱操作")]
+    MilvusKB --> Graph[("NebulaGraph，图谱操作")]
     Connector --> External["外部检索与阅读 API"]
 
     Context["可信用户与会话选择"] --> Integration["Knowledge 提供 SDK Auth"]
@@ -52,7 +52,7 @@ flowchart LR
     Service --> Manager
 ```
 
-管理路由对配置、列表和详情直接调用 Manager，对解析和索引登记后台作业；worker 根据 registry 调用知识库 service，再由 Manager 选择 executor。启用 Knowledge 时，worker 在补发和消费任务前初始化已有知识库执行器，并通过真实 Neo4j 会话确认图谱连接；失败会阻止 worker 启动，Compose 按既有策略重启，pending 意图保持未领取。关闭 Knowledge 时跳过这两个连接步骤。Manager 负责配置和 executor 选择；具体 executor 负责解析、索引和检索。知识库配置的最终值在 PostgreSQL，Redis 只缓存最小运行配置，未命中或异常时回源数据库。
+管理路由对配置、列表和详情直接调用 Manager，对解析和索引登记后台作业；worker 根据 registry 调用知识库 service，再由 Manager 选择 executor。启用 Knowledge 时，worker 在补发和消费任务前初始化已有知识库执行器，并通过真实 NebulaGraph 连接确认图谱可用；失败会阻止 worker 启动，Compose 按既有策略重启，pending 意图保持未领取。关闭 Knowledge 时跳过这两个连接步骤。Manager 负责配置和 executor 选择；具体 executor 负责解析、索引和检索。知识库配置的最终值在 PostgreSQL，Redis 只缓存最小运行配置，未命中或异常时回源数据库。
 
 未删除知识库的名称由 PostgreSQL 唯一索引约束，名称不区分大小写，已删除名称可复用。并发创建或重命名冲突返回 HTTP 409，冲突事务不改变已有记录。
 
@@ -60,9 +60,9 @@ flowchart LR
 
 `KnowledgeExecutor` 表示按知识库类型复用的执行器，`KnowledgeBase` ORM 表示 PostgreSQL 配置行。Manager 保留配置解析、类型选择、权限摘要和公开结果装配；文件元数据、目录、正文窗口和原件读取直接进入知识域 service/repository，不要求装配检索客户端。类型配置和查询默认值由类型类提供；解析、索引、检索及外部正文阅读才使用执行器。`services/access.py` 拥有用户可见范围，管理路由、Public API 与 Knowledge MCP 在知识域调用该入口；Agent 通过 HTTP MCP 消费授权后的结果。
 
-文档与图谱通过 `knowledge/storage/milvus.py` 装配中文正文、embedding、BM25 函数和索引。文档、实体和三元组各自保留已有列顺序及来源字段。新集合采用统一字段定义，已有集合不自动重建。Milvus 与 Neo4j 查询分别使用每事件循环 8 个线程的预算；调用方取消等待后，实际线程退出才归还容量。
+文档与图谱通过 `knowledge/storage/milvus.py` 装配中文正文、embedding、BM25 函数和索引。文档、实体和三元组各自保留已有列顺序及来源字段。新集合采用统一字段定义，已有集合不自动重建。Milvus 与图库查询分别使用每事件循环 8 个线程的预算；调用方取消等待后，实际线程退出才归还容量。
 
-Milvus 执行器持有 `KnowledgeGraphService`，首次图检索在线程内初始化图向量客户端，后续请求复用。Neo4j 连接由基础设施管理，图谱服务协调 PG 事实与 Neo4j/Milvus 投影。一次图谱构建复用一个抽取模型客户端；模型 JSON 归一化负责实体属性合并和关系去重，图 payload 转换只分配局部 ID。
+Milvus 执行器持有 `KnowledgeGraphService`，首次图检索在线程内初始化图向量客户端，后续请求复用。NebulaGraph 连接由基础设施管理，图谱服务协调 PG 事实与图/向量投影。一次图谱构建复用一个抽取模型客户端；模型 JSON 归一化负责实体属性合并和关系去重，图 payload 转换只分配局部 ID。
 
 `services/graph_build.py` 拥有构建与向量修复的提交准入、唯一 Job 登记和重置前的活动任务检查。HTTP 路由校验权限并适配响应；worker 消费已登记的 action，直接调用图谱执行器，执行器重新验证知识库类型与锁定配置并持有投影锁。提交预检与重置的活动任务检查各自读取当前事实，不提供跨请求的串行化承诺。
 
@@ -109,7 +109,7 @@ Milvus 文件的清除图谱、重新解析和 Markdown 编辑需要 manage 权�
 | PostgreSQL | 知识库配置、权限、文件元数据和状态、chunk 正文与原文行号、图谱处理状态、BackgroundJob 执行意图与 lease | 原文件字节、向量索引 |
 | MinIO | 上传原件、解析 Markdown、解析图片 | 文件当前状态、用户权限 |
 | Milvus | chunk 向量、BM25/混合检索字段、图实体和关系向量 | 权限、文件状态 |
-| Neo4j | 图谱实体、关系和 chunk 关联 | 原文件、权限和检索排序 |
+| NebulaGraph | 图谱实体、关系和 chunk 关联 | 原文件、权限和检索排序 |
 | Redis / ARQ | BackgroundJob 投递与 worker 唤醒、知识库最小运行配置缓存 | BackgroundJob 最终状态、配置最终值、文件状态 |
 
 知识库解析先生成本地 Markdown 目录，再将图片和 Markdown 写入该文档本次解析的独占 MinIO 前缀。文件记录提交 `parsed` 与新 Markdown 路径后，服务回收旧尝试；失败或 owner 丢失只回收未发布的当前尝试，旧产物保持可读。取消发生在结果发布后的旧资源回收阶段时，已发布结果仍然有效。删除文档按文档前缀回收解析资源和 Office 预览，其他文档的资源保留。预览转换持有共享投影锁，发布前重新检查文件有效性；删除清理取得排他锁后回收产物，避免转换在删除之后复活预览。
@@ -148,7 +148,7 @@ JobTracker 保存任务登记、执行方上报的进度与结果摘要，并提
 
 提交端在事务完成后发布作业 ID；worker 从共享作业定义加载 Handler，拥有领取、执行、超时和失联检测，用唯一 attempt token claim 作业 并续租 lease；重复投递和失权 worker 的迟到写入会被 PostgreSQL 拒绝。首次发布失败时，pending 作业 保留，启动和周期 publisher 会补发。所有 后台作业 在 owner 中断或 lease 过期后都会明确失败，不自动重放未知外部副作用。领域 failure hook 由 worker 在终态事务中调用，JobTracker 的观察和取消入口不调用这些 Hook。
 
-批量“待解析”和“待入库”入口按状态筛选文件，并通过数据库 dedupe key 拒绝活跃重复任务。取消任务时先保存 `cancel_requested`；pending 任务由 worker 确认无需执行，running 任务由领域 Handler 在安全检查点响应。确认前任务保持原状态，已经终态的记录拒绝迟到写入。重试前保留故障现场，检查文件记录、MinIO、chunk、Milvus 和 Neo4j，再选择重新解析、重新索引或图谱修复。
+批量“待解析”和“待入库”入口按状态筛选文件，并通过数据库 dedupe key 拒绝活跃重复任务。取消任务时先保存 `cancel_requested`；pending 任务由 worker 确认无需执行，running 任务由领域 Handler 在安全检查点响应。确认前任务保持原状态，已经终态的记录拒绝迟到写入。重试前保留故障现场，检查文件记录、MinIO、chunk、Milvus 和 Nebula，再选择重新解析、重新索引或图谱修复。
 
 ## Agent 如何看到知识库
 
@@ -218,4 +218,4 @@ Agent Context 中的资源选项查询用于配置界面；执行权限仍由访
 - [知识库 HTTP integration](https://github.com/xerrors/Yuxi/blob/main/backend/test/integration/api/test_knowledge_router.py)
 - [Public 工具 integration](https://github.com/xerrors/Yuxi/blob/main/backend/test/integration/api/test_public_knowledge_tools.py)
 
-修改状态、权限、存储或 Agent 工具链路时，至少运行对应 unit 和真实 HTTP integration；涉及外部存储时，从 PostgreSQL、MinIO、Milvus 或 Neo4j 回读最终结果。
+修改状态、权限、存储或 Agent 工具链路时，至少运行对应 unit 和真实 HTTP integration；涉及外部存储时，从 PostgreSQL、MinIO、Milvus 或 NebulaGraph 回读最终结果。

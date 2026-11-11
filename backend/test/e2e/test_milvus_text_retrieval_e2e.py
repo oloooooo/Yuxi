@@ -21,6 +21,7 @@ from pymilvus import Collection, connections, utility
 from sqlalchemy import select
 
 from test.e2e.e2e_helpers import wait_model_provider_cache
+from yuxi.infrastructure.nebula import result_rows
 from yuxi.infrastructure.minio import get_minio_client
 from yuxi.infrastructure.minio.object_urls import parse_minio_url
 from yuxi.infrastructure.postgres.manager import pg_manager
@@ -402,7 +403,7 @@ async def test_worker_index_and_all_search_modes_use_text_constraints(e2e_client
         graph_service = KnowledgeGraphService(graph_vector_store=graph_store)
 
         async def seed_file_graph(filename="match.md", attribute="public-A"):
-            """为 active Chunk 发布真实 PG/Neo4j/图向量，验证代次与文件删除。"""
+            """为 active Chunk 发布真实 PG/图库/图向量，验证代次与文件删除。"""
             [chunk] = await repository.list_by_file_id(file_ids[filename])
             payload = normalize_extraction_result(
                 {
@@ -422,7 +423,7 @@ async def test_worker_index_and_all_search_modes_use_text_constraints(e2e_client
             assert await graph_repo.count_by_kb_id(kb_id) == (2, 1)
 
         async def publish_chunk_graph(chunk, payload):
-            """发布测试初始图谱，真实写入 PG、Neo4j 与 Milvus。"""
+            """发布测试初始图谱，真实写入 PG、图库与 Milvus。"""
             await repository.update_extraction_result(chunk.chunk_id, payload)
             entities, triples = await asyncio.to_thread(graph_service.write_chunk_graph, kb_id, chunk, payload)
             await graph_repo.upsert_chunk_graph(
@@ -461,9 +462,13 @@ async def test_worker_index_and_all_search_modes_use_text_constraints(e2e_client
                 assert expected_ids <= {row["id"] for row in projected}
 
         def graph_node_count():
-            """回读 Neo4j，而不是相信清理回调的返回值。"""
-            with graph_service.driver.session() as session:
-                return session.run("MATCH (n:MilvusKB {kb_id: $kb_id}) RETURN count(n) AS count", kb_id=kb_id).single()["count"]
+            """回读图库，而不是相信清理回调的返回值。"""
+            rows = result_rows(
+                graph_service.connection.execute(
+                    f'MATCH (n:Node) WHERE n.Node.kb_id == "{kb_id}" RETURN count(n) AS count'
+                )
+            )
+            return rows[0]["count"]
 
         await seed_file_graph()
         assert await asyncio.to_thread(graph_node_count) == 3
@@ -474,7 +479,7 @@ async def test_worker_index_and_all_search_modes_use_text_constraints(e2e_client
                 await graph_service.delete_file_graph(kb_id, file_ids["match.md"], generation=seeded_chunk.generation)
         assert await graph_repo.count_by_kb_id(kb_id) == (2, 1)
         assert await asyncio.to_thread(graph_node_count) == 3
-        # 历史半成品仍有 Neo4j 文件归属与真实图向量，但 PG Chunk/提及已经级联消失。
+        # 历史半成品仍有图库文件归属与真实图向量，但 PG Chunk/提及已经级联消失。
         lost_generation = seeded_chunk.generation + 1000
         [lost_chunk] = await repository.batch_upsert(
             [

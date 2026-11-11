@@ -13,23 +13,27 @@ import time
 from typing import Any
 
 from yuxi.infrastructure.filesystem import await_io
-from yuxi.infrastructure.neo4j import (
-    Neo4jConnectionManager,
-    get_shared_neo4j_connection,
-    neo4j_read,
-    neo4j_write,
-    safe_neo4j_label,
+from yuxi.infrastructure.nebula import (
+    NebulaConnectionManager,
+    get_shared_nebula_connection,
+    ngql_list,
+    ngql_literal,
+    result_rows,
 )
 from yuxi.infrastructure.observability.logging import logger
 from yuxi.modules.knowledge.graphs.extractors import GraphExtractor, GraphExtractorFactory, normalize_extraction_result
 from yuxi.modules.knowledge.graphs.graph_utils import (
     build_graph_payload,
+    chunk_vid,
     compute_entity_id,
     compute_triple_id,
-    cypher_merge_chunk,
-    cypher_merge_entity_mention,
-    cypher_merge_relation,
+    entity_vid,
+    ngql_insert_mention,
+    ngql_insert_relation,
+    ngql_upsert_chunk,
+    ngql_upsert_entity,
     normalize_entity_name,
+    relation_rank,
 )
 from yuxi.modules.knowledge.graphs.milvus_graph_vector_store import MilvusGraphVectorStore
 from yuxi.modules.knowledge.repositories.bases import KnowledgeBaseRepository
@@ -37,7 +41,7 @@ from yuxi.modules.knowledge.repositories.chunks import KnowledgeChunkRepository
 from yuxi.modules.knowledge.repositories.document_resets import DocumentResetRepository
 from yuxi.modules.knowledge.repositories.graphs import KnowledgeGraphRepository
 from yuxi.modules.knowledge.repositories.projections import knowledge_projection_lock
-from yuxi.modules.knowledge.storage.offload import run_milvus_query_io, run_neo4j_query_io
+from yuxi.modules.knowledge.storage.offload import run_milvus_query_io, run_nebula_query_io
 from yuxi.shared.datetime import utc_isoformat
 from yuxi.shared.errors import ResourceNotFoundError
 
@@ -68,7 +72,7 @@ class KnowledgeGraphService:
         chunk_repo: KnowledgeChunkRepository | None = None,
         graph_repo: KnowledgeGraphRepository | None = None,
         graph_vector_store: MilvusGraphVectorStore | None = None,
-        neo4j_connection: Neo4jConnectionManager | None = None,
+        nebula_connection: NebulaConnectionManager | None = None,
     ):
         self.kb_id = kb_id
         self.kb_repo = kb_repo or KnowledgeBaseRepository()
@@ -76,12 +80,12 @@ class KnowledgeGraphService:
         self.graph_repo = graph_repo or KnowledgeGraphRepository()
         self._graph_vector_store = graph_vector_store
         self._graph_vector_store_lock = asyncio.Lock()
-        self._connection = neo4j_connection
+        self._connection = nebula_connection
 
     @property
-    def connection(self) -> Neo4jConnectionManager:
+    def connection(self) -> NebulaConnectionManager:
         if self._connection is None:
-            self._connection = get_shared_neo4j_connection()
+            self._connection = get_shared_nebula_connection()
         return self._connection
 
     @property
@@ -552,8 +556,7 @@ class KnowledgeGraphService:
         chunk,
         normalized_result: dict[str, Any],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """将单个 chunk 的抽取结果写入 Neo4j。"""
-        label = safe_neo4j_label(kb_id)
+        """将单个 chunk 的抽取结果写入 NebulaGraph。"""
         graph_payload = build_graph_payload(normalized_result)
         extractor_type = graph_payload["metadata"].get("extractor_type", "unknown")
         entities = graph_payload["entities"]
@@ -563,58 +566,62 @@ class KnowledgeGraphService:
         triple_records = self._build_triple_records(kb_id, relations, entity_record_by_local_id, extractor_type)
         content_preview = (chunk.content or "")[:300]
 
-        # 预构建 Cypher 模板（同一 chunk 内复用）
-        merge_chunk_cypher = cypher_merge_chunk(label)
-        merge_entity_cypher = cypher_merge_entity_mention(label)
-        merge_relation_cypher = cypher_merge_relation(label)
-
-        def query(tx):
-            # 1. MERGE Chunk 节点
-            tx.run(
-                merge_chunk_cypher,
+        # 单条 nGQL 无法表达多次 MERGE，按顶点/边类型分条写入
+        statements = [
+            ngql_upsert_chunk(
+                kb_id=kb_id,
                 chunk_id=chunk.chunk_id,
                 file_id=chunk.file_id,
-                kb_id=kb_id,
                 chunk_index=chunk.chunk_index,
                 content_preview=content_preview,
                 start_char_pos=chunk.start_char_pos,
                 end_char_pos=chunk.end_char_pos,
             )
-
-            # 2. MERGE Entity 节点 + Chunk→Entity (MENTIONS)；写入参数直接取自 PG 投影记录
-            for entity_record in entity_records:
-                tx.run(
-                    merge_entity_cypher,
-                    chunk_id=chunk.chunk_id,
-                    file_id=chunk.file_id,
+        ]
+        # 2. 实体顶点 + Chunk→Entity (MENTIONS)；取值直接来自 PG 投影记录
+        for entity_record in entity_records:
+            statements.append(
+                ngql_upsert_entity(
                     kb_id=kb_id,
                     entity_id=entity_record["entity_id"],
                     normalized_name=entity_record["normalized_name"],
-                    entity_label=entity_record["label"],
+                    label=entity_record["label"],
                     name=entity_record["name"],
                     attributes=json.dumps(entity_record["attributes"], ensure_ascii=False),
+                    source_chunk_id=chunk.chunk_id,
                 )
-
-            # 3. MERGE Entity→Entity (RELATION) 边；triple_id 与关系类型复用 PG 投影记录的取值
-            for relation, triple_record in zip(relations, triple_records, strict=True):
-                source_record = entity_record_by_local_id[relation["source"]]
-                target_record = entity_record_by_local_id[relation["target"]]
-                tx.run(
-                    merge_relation_cypher,
+            )
+            statements.append(
+                ngql_insert_mention(
                     kb_id=kb_id,
                     chunk_id=chunk.chunk_id,
                     file_id=chunk.file_id,
-                    source_name=source_record["normalized_name"],
-                    source_label=source_record["label"],
-                    target_name=target_record["normalized_name"],
-                    target_label=target_record["label"],
+                    entity_id=entity_record["entity_id"],
+                )
+            )
+
+        # 3. Entity→Entity (RELATION) 边；rank 由 chunk 与关系类型决定
+        for relation, triple_record in zip(relations, triple_records, strict=True):
+            source_record = entity_record_by_local_id[relation["source"]]
+            target_record = entity_record_by_local_id[relation["target"]]
+            statements.append(
+                ngql_insert_relation(
+                    kb_id=kb_id,
+                    chunk_id=chunk.chunk_id,
+                    file_id=chunk.file_id,
+                    source_entity_id=source_record["entity_id"],
+                    target_entity_id=target_record["entity_id"],
                     relation_type=triple_record["relation_type"],
                     triple_id=triple_record["triple_id"],
                     text=triple_record["text"],
+                    source_name=source_record["normalized_name"],
+                    target_name=target_record["normalized_name"],
                     extractor_type=triple_record["extractor_type"],
                 )
+            )
 
-        neo4j_write(self.driver, query)
+        for statement in statements:
+            self.connection.execute(statement)
         return entity_records, triple_records
 
     def _build_entity_records(self, kb_id: str, entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -687,7 +694,6 @@ class KnowledgeGraphService:
         if not effective_kb_id:
             return {"nodes": [], "edges": []}
 
-        label = safe_neo4j_label(effective_kb_id)
         if file_id is not None:
             # 同一事务持有投影锁与文件行锁，直到图读取完成。
             async with self.graph_repo.file_graph_snapshot(effective_kb_id, file_id) as snapshot:
@@ -696,10 +702,9 @@ class KnowledgeGraphService:
                 entity_mentions, triple_mentions, chunk_ids = snapshot
                 if not entity_mentions and (exclude_chunk or not chunk_ids):
                     return {"nodes": [], "edges": []}
-                result = await run_neo4j_query_io(
+                result = await run_nebula_query_io(
                     self._query_file_nodes_sync,
                     effective_kb_id,
-                    label,
                     keyword,
                     max_nodes,
                     max_depth,
@@ -720,10 +725,9 @@ class KnowledgeGraphService:
                 return result
 
         limit = max_nodes
-        result = await run_neo4j_query_io(
+        result = await run_nebula_query_io(
             self._query_nodes_sync,
             effective_kb_id,
-            label,
             keyword,
             limit,
             max_depth,
@@ -731,10 +735,51 @@ class KnowledgeGraphService:
         )
         return await self._filter_visible_subgraph(effective_kb_id, result)
 
+    def _rows(self, ngql: str) -> list[dict[str, Any]]:
+        """执行 nGQL 并返回字典行。"""
+        return result_rows(self.connection.execute(ngql))
+
+    def _subgraph_ngql(self, kb_id: str, seeds: list[str], max_depth: int, path_filters: list[str], path_limit: int) -> str:
+        """按种子顶点展开变长路径；顶点属性只在 tag 限定下可读。"""
+        conditions = [f"id(seed) IN {ngql_list(seeds)}", f"all(x IN nodes(p) WHERE x.Node.kb_id == {ngql_literal(kb_id)})"]
+        conditions.extend(path_filters)
+        where = " AND ".join(conditions)
+        return f"""
+        MATCH p=(seed:Node)-[*1..{max_depth}]-(m:Node)
+        WHERE {where}
+        RETURN [x IN nodes(p) | id(x)] AS node_ids,
+               [x IN nodes(p) | properties(x)] AS node_props,
+               [r IN relationships(p) | [src(r), dst(r), type(r), rank(r), properties(r)]] AS edges
+        LIMIT {max(path_limit, 1)}
+        """
+
+    def _subgraph_from_ngql(self, ngql: str, limit: int) -> dict[str, Any]:
+        """把多行路径结果去重并裁成前端契约的 {nodes, edges}。"""
+        raw_nodes: dict[str, dict[str, Any]] = {}
+        raw_edges: list[dict[str, Any]] = []
+        for row in self._rows(ngql):
+            for node_id, props in zip(row.get("node_ids") or [], row.get("node_props") or [], strict=True):
+                properties = props or {}
+                raw_nodes.setdefault(node_id, {"id": node_id, "labels": [properties.get("kind")], "properties": properties})
+            for source, target, edge_type, rank, props in row.get("edges") or []:
+                properties = props or {}
+                raw_edges.append(
+                    {
+                        "id": f"{source}|{target}|{rank}",
+                        "source_id": source,
+                        "target_id": target,
+                        # 关系边对外暴露业务关系类型，与原 properties.type 口径一致
+                        "type": properties.get("rel_type") or edge_type,
+                        "properties": properties,
+                    }
+                )
+        nodes = [self._normalize_node(node) for node in raw_nodes.values()]
+        edges = [self._normalize_edge(edge) for edge in raw_edges]
+        return self._finalize_subgraph_result(nodes, edges, limit)
+
     def _query_file_nodes_sync(
         self,
         kb_id: str,
-        label: str,
         keyword: str,
         limit: int,
         max_depth: int,
@@ -743,81 +788,89 @@ class KnowledgeGraphService:
         triple_mentions: list[dict[str, str]],
         chunk_ids: list[str],
     ) -> dict[str, Any]:
-        """先按 PG 来源约束 Neo4j 路径，再限制结果数量。"""
+        """先按 PG 来源约束路径，再限制结果数量。"""
         entity_ids = list({m["id"] for m in entity_mentions})
-        node_scope = "(node.entity_id IN $entity_ids OR node.chunk_id IN $chunk_ids)"
-        if exclude_chunk:
-            node_scope = "node.entity_id IN $entity_ids"
-        seed_scope = node_scope.replace("node.", "n.")
-        keyword_scope = "true"
-        if keyword and keyword != "*":
-            keyword_scope = """(
-                toLower(CASE WHEN n.entity_id IS NOT NULL AND NOT any(mention IN $entity_mentions WHERE
-                    mention.id = n.entity_id AND mention.chunk_id = n.source_chunk_id)
-                    THEN coalesce(n.normalized_name, '') ELSE coalesce(n.name, '') END) CONTAINS toLower($keyword)
-                OR toLower(coalesce(n.content_preview, '')) CONTAINS toLower($keyword)
-                OR toLower(coalesce(n.chunk_id, '')) CONTAINS toLower($keyword))"""
-        depth = min(max(max_depth, 1), 3)
-        query = f"""
-        MATCH (n:MilvusKB:`{label}`)
-        WHERE {seed_scope} AND {keyword_scope}
-        WITH n LIMIT $limit
-        WITH collect(n) AS seeds
-        UNWIND seeds AS seed
-        OPTIONAL MATCH p = (seed)-[*1..{depth}]-(m:MilvusKB:`{label}`)
-        WHERE all(node IN nodes(p) WHERE node:MilvusKB AND node:`{label}` AND {node_scope})
-          AND all(rel IN relationships(p) WHERE
-            (type(rel) = 'MENTIONS' AND any(mention IN $entity_mentions WHERE
-                mention.id = endNode(rel).entity_id AND mention.chunk_id = rel.chunk_id
-                AND startNode(rel).chunk_id = rel.chunk_id))
-            OR (type(rel) = 'RELATION' AND any(mention IN $triple_mentions WHERE
-                mention.id = rel.triple_id AND mention.chunk_id = rel.chunk_id)))
-        WITH seeds, p LIMIT $path_limit
-        WITH seeds, collect(p) AS paths
-        RETURN seeds + reduce(path_nodes = [], path IN paths | path_nodes + nodes(path)) AS nodes,
-               reduce(path_edges = [], path IN paths | path_edges + relationships(path)) AS edges
-        """
-        with self.driver.session() as session:
-            record = session.run(
-                query,
-                keyword=keyword,
-                limit=limit,
-                path_limit=max(limit, 1) * 10,
-                entity_ids=entity_ids,
-                chunk_ids=chunk_ids,
-                entity_mentions=entity_mentions,
-                triple_mentions=triple_mentions,
-            ).single()
-            return self._process_subgraph_record(record, limit, kb_id) if record else {"nodes": [], "edges": []}
+        entity_vids = [entity_vid(kb_id, entity_id) for entity_id in entity_ids]
+        scope = [self._in_list("n.Node.chunk_id", chunk_ids)]
+        path_scope = [self._in_list("x.Node.chunk_id", chunk_ids)]
+        if not exclude_chunk:
+            scope.insert(0, self._in_list("n.Node.entity_id", entity_ids))
+            scope = ["(" + " OR ".join(scope) + ")"]
+            path_scope.insert(0, self._in_list("x.Node.entity_id", entity_ids))
+            path_scope = ["(" + " OR ".join(path_scope) + ")"]
+        else:
+            scope = [self._in_list("n.Node.entity_id", entity_ids)]
+            path_scope = [self._in_list("x.Node.entity_id", entity_ids)]
+
+        seeds = self._seed_vids(kb_id, keyword, limit, scope)
+        if max_depth <= 0:
+            return self._finalize_subgraph_result(seeds[:limit], [], limit)
+        if not seeds:
+            return self._empty_subgraph()
+        mention_filter = (
+            f'(type(r) == "MENTIONS" AND {self._in_list("r.chunk_id", chunk_ids)} AND {self._in_list("dst(r)", entity_vids)})'
+            f' OR (type(r) == "RELATION" AND {self._in_list("r.chunk_id", chunk_ids)}'
+            f' AND {self._in_list("r.triple_id", [m["id"] for m in triple_mentions])})'
+        )
+        path_filters = ["all(x IN nodes(p) WHERE " + " AND ".join(path_scope) + ")", f"all(r IN relationships(p) WHERE {mention_filter})"]
+        seed_vids = [seed["id"] for seed in seeds]
+        ngql = self._subgraph_ngql(kb_id, seed_vids, min(max_depth, 3), path_filters, max(limit, 1) * 10)
+        result = self._subgraph_from_ngql(ngql, limit)
+        result["nodes"].sort(key=lambda node: seed_vids.index(node["id"]) if node["id"] in seed_vids else len(seed_vids))
+        return result
+
+    @staticmethod
+    def _in_list(column: str, values: list[str]) -> str:
+        """空列表不能用 `IN []`，退化为恒假条件。"""
+        return f"{column} IN {ngql_list(values)}" if values else "false"
+
+    def _seed_vids(self, kb_id: str, keyword: str, limit: int, scope: list[str]) -> list[dict[str, Any]]:
+        """按关键字与作用域选种子顶点，返回 vid 与属性。"""
+        conditions = [f"n.Node.kb_id == {ngql_literal(kb_id)}", *scope, *self._keyword_conditions(keyword)]
+        ngql = (
+            "MATCH (n:Node) WHERE " + " AND ".join(conditions) + "\n"
+            "RETURN id(n) AS id, properties(n) AS props\n"
+            f"LIMIT {max(int(limit), 1)}"
+        )
+        return [
+            self._normalize_node({"id": row["id"], "labels": [(row["props"] or {}).get("kind")], "properties": row["props"] or {}})
+            for row in self._rows(ngql)
+        ]
+
+    @staticmethod
+    def _keyword_conditions(keyword: str) -> list[str]:
+        """关键字命中名字、预览或 chunk 标识。"""
+        if not keyword or keyword == "*":
+            return []
+        value = ngql_literal(keyword.lower())
+        columns = ("name", "normalized_name", "content_preview", "chunk_id")
+        return ["(" + " OR ".join(f"toLower(coalesce(n.Node.{column}, \"\")) CONTAINS {value}" for column in columns) + ")"]
+
+    def _empty_subgraph(self) -> dict[str, Any]:
+        return {"nodes": [], "edges": []}
 
     def _query_nodes_sync(
         self,
         kb_id: str,
-        label: str,
         keyword: str,
         limit: int,
         max_depth: int,
         exclude_chunk: bool,
     ) -> dict[str, Any]:
-        with self.driver.session() as session:
-            query_params: dict[str, Any] = {
-                "keyword": keyword,
-                "limit": limit,
-            }
-            if max_depth > 0:
-                # 多跳深度封顶 3，防止变长路径在 Neo4j 侧发散
-                max_depth = min(max_depth, 3)
-                query_params["path_limit"] = max(limit, 1) * 10
-            result = session.run(
-                self._build_query(label, keyword, max_depth, exclude_chunk),
-                **query_params,
-            )
-            if max_depth <= 0:
-                return self._process_query_result(result, limit, kb_id, exclude_chunk)
-            record = result.single()
-            if not record:
-                return {"nodes": [], "edges": []}
-            return self._process_subgraph_record(record, limit, kb_id)
+        scope = ["n.Node.kind != \"Chunk\""] if exclude_chunk else []
+        seeds = self._seed_vids(kb_id, keyword, limit, scope)
+        if max_depth <= 0:
+            return self._finalize_subgraph_result(seeds, [], limit)
+        if not seeds:
+            return self._empty_subgraph()
+        path_filters = ["all(x IN nodes(p) WHERE x.Node.kind != \"Chunk\")"] if exclude_chunk else []
+        ngql = self._subgraph_ngql(kb_id, [seed["id"] for seed in seeds], min(max_depth, 3), path_filters, max(limit, 1) * 10)
+        result = self._subgraph_from_ngql(ngql, limit)
+        # 种子必须排在扩展结果之前，前端按此顺序渲染
+        seed_ids = [seed["id"] for seed in seeds]
+        order = {vid: index for index, vid in enumerate(seed_ids)}
+        result["nodes"].sort(key=lambda node: order.get(node["id"], len(order)))
+        return result
 
     async def query_seed_subgraph(
         self,
@@ -829,45 +882,10 @@ class KnowledgeGraphService:
         if not entity_ids:
             return {"nodes": [], "edges": []}
         seed_entity_ids = list(dict.fromkeys(entity_ids))
-        label = safe_neo4j_label(kb_id)
-        cypher = f"""
-        MATCH (seed:Entity:MilvusKB:`{label}`)
-        WHERE seed.entity_id IN $entity_ids
-        MATCH p = (seed)-[*1..2]-(n:MilvusKB:`{label}`)
-        WITH p LIMIT $path_limit
-        WITH collect(p) AS paths
-        UNWIND paths AS node_path
-        UNWIND nodes(node_path) AS node
-        WITH paths, collect(DISTINCT node) AS graph_nodes
-        UNWIND paths AS rel_path
-        UNWIND relationships(rel_path) AS rel
-        RETURN graph_nodes AS nodes, collect(DISTINCT rel) AS edges
-        """
-        result = await run_neo4j_query_io(
-            self._query_seed_subgraph_sync,
-            kb_id,
-            cypher,
-            seed_entity_ids,
-            max_nodes,
-        )
+        seeds = [entity_vid(kb_id, entity_id) for entity_id in seed_entity_ids]
+        ngql = self._subgraph_ngql(kb_id, seeds, 2, [], max(max_nodes, 1) * 4)
+        result = self._subgraph_from_ngql(ngql, max_nodes)
         return await self._filter_visible_subgraph(kb_id, result)
-
-    def _query_seed_subgraph_sync(
-        self,
-        kb_id: str,
-        cypher: str,
-        entity_ids: list[str],
-        max_nodes: int,
-    ) -> dict[str, Any]:
-        with self.driver.session() as session:
-            record = session.run(
-                cypher,
-                entity_ids=entity_ids,
-                path_limit=max(max_nodes, 1) * 4,
-            ).single()
-            if not record:
-                return {"nodes": [], "edges": []}
-            return self._process_subgraph_record(record, max_nodes, kb_id)
 
     async def query_and_rank_chunks_by_ppr(
         self,
@@ -946,51 +964,36 @@ class KnowledgeGraphService:
         effective_kb_id = kb_id or self.kb_id
         if not effective_kb_id:
             return []
-        label = safe_neo4j_label(effective_kb_id)
-
-        cypher = f"""
-        MATCH (n:MilvusKB:`{label}`)
-        UNWIND labels(n) AS node_label
-        WITH DISTINCT node_label
-        WHERE node_label <> 'MilvusKB' AND node_label <> $kb_id
-        RETURN node_label
-        ORDER BY node_label
-        """
-        records = await run_neo4j_query_io(self._get_labels_sync, cypher, effective_kb_id)
-        return [record["node_label"] for record in records]
-
-    def _get_labels_sync(self, cypher: str, kb_id: str) -> list[Any]:
-        return neo4j_read(self.driver, cypher, kb_id=kb_id)
+        rows = self._rows(
+            f"MATCH (n:Node) WHERE n.Node.kb_id == {ngql_literal(effective_kb_id)} RETURN DISTINCT n.Node.kind AS kind"
+        )
+        return sorted({row["kind"] for row in rows if row["kind"]})
 
     async def get_stats(self, kb_id: str | None = None) -> dict[str, Any]:
         effective_kb_id = kb_id or self.kb_id
         if not effective_kb_id:
             return {"total_nodes": 0, "total_edges": 0, "entity_types": []}
-        label = safe_neo4j_label(effective_kb_id)
+        return await run_nebula_query_io(self._get_stats_sync, ngql_literal(effective_kb_id))
 
-        stats_cypher = f"""
-        MATCH (n:MilvusKB:`{label}`)
-        WITH count(n) AS node_count
-        OPTIONAL MATCH (:MilvusKB:`{label}`)-[r]->(:MilvusKB:`{label}`)
-        RETURN node_count, count(r) AS edge_count
-        """
-        label_cypher = f"""
-        MATCH (n:Entity:MilvusKB:`{label}`)
-        WITH n.label AS entity_label, count(*) AS count
-        RETURN entity_label, count
-        ORDER BY count DESC
-        """
-        return await run_neo4j_query_io(self._get_stats_sync, stats_cypher, label_cypher)
-
-    def _get_stats_sync(self, stats_cypher: str, label_cypher: str) -> dict[str, Any]:
-        with self.driver.session() as session:
-            stats = session.run(stats_cypher).single()
-            label_stats = session.run(label_cypher)
-            return {
-                "total_nodes": stats["node_count"] if stats else 0,
-                "total_edges": stats["edge_count"] if stats else 0,
-                "entity_types": [{"type": row["entity_label"], "count": row["count"]} for row in label_stats],
-            }
+    def _get_stats_sync(self, kb_literal: str) -> dict[str, Any]:
+        node_rows = self._rows(f"MATCH (n:Node) WHERE n.Node.kb_id == {kb_literal} RETURN count(n) AS node_count")
+        edge_rows = self._rows(
+            f"MATCH (a:Node)-[r:MENTIONS|RELATION]->(b:Node) WHERE a.Node.kb_id == {kb_literal} RETURN count(r) AS edge_count"
+        )
+        label_rows = self._rows(
+            f"MATCH (n:Node) WHERE n.Node.kb_id == {kb_literal} AND n.Node.kind == \"Entity\" "
+            "RETURN n.Node.label AS entity_label, count(*) AS count"
+        )
+        entity_types = sorted(
+            ({"type": row["entity_label"], "count": row["count"]} for row in label_rows if row["entity_label"]),
+            key=lambda item: item["count"],
+            reverse=True,
+        )
+        return {
+            "total_nodes": node_rows[0]["node_count"] if node_rows else 0,
+            "total_edges": edge_rows[0]["edge_count"] if edge_rows else 0,
+            "entity_types": entity_types,
+        }
 
     # ─── 运维：重置、向量对账与删除 ───────────────────────────────
 
@@ -1038,12 +1041,14 @@ class KnowledgeGraphService:
         }
 
     def delete_graph(self, kb_id: str) -> None:
-        label = safe_neo4j_label(kb_id)
-
-        def query(tx):
-            tx.run(f"MATCH (n:MilvusKB:`{label}`) DETACH DELETE n")
-
-        neo4j_write(self.driver, query)
+        """删除知识库全部顶点与边；空图直接跳过。"""
+        kb = ngql_literal(kb_id)
+        if not self._rows(f"MATCH (n:Node) WHERE n.Node.kb_id == {kb} RETURN count(n) AS c")[0]["c"]:
+            self.graph_vector_store.drop_graph_collections(kb_id)
+            return
+        self.connection.execute(
+            f"LOOKUP ON Node WHERE Node.kb_id == {kb} YIELD id(vertex) AS vid | DELETE VERTEX $-.vid WITH EDGE"
+        )
         self.graph_vector_store.drop_graph_collections(kb_id)
 
     async def clear_file_graph(self, kb_id: str, file_id: str, *, generation: int, context=None) -> dict[str, Any]:
@@ -1065,7 +1070,7 @@ class KnowledgeGraphService:
         if generation is not None:
             chunk_ids = await self.chunk_repo.list_ids_by_file_generation(file_id, generation)
         affected_entities, affected_triples = await await_io(asyncio.to_thread(self._file_graph_record_ids, kb_id, file_id, chunk_ids))
-        # 历史孤儿已无 PG 提及；先提交其撤销，保留 Neo4j 归属作为后续失败重试的范围证据。
+        # 历史孤儿已无 PG 提及；先提交其撤销，保留图库归属作为后续失败重试的范围证据。
         await self.graph_repo.delete_orphan_records(entity_ids=affected_entities, triple_ids=affected_triples)
         sources = await self.graph_repo.file_entity_sources(file_id, generation=generation, additional_entity_ids=affected_entities)
         restored_by_id = {}
@@ -1107,84 +1112,88 @@ class KnowledgeGraphService:
                     triple_ids=orphan_triple_ids,
                 )
             )
-            # 全文件清理也覆盖历史上已经失去 PG Chunk 的 Neo4j 半成品。
-            neo4j_chunks = chunk_ids if generation is not None else None
-            await await_io(asyncio.to_thread(self._delete_file_graph_from_neo4j, kb_id, file_id, neo4j_chunks, restored_entities))
+            # 全文件清理也覆盖历史上已经失去 PG Chunk 的图半成品。
+            graph_chunks = chunk_ids if generation is not None else None
+            await await_io(asyncio.to_thread(self._delete_file_graph_from_graph, kb_id, file_id, graph_chunks, restored_entities))
 
     def _file_graph_record_ids(self, kb_id: str, file_id: str, chunk_ids: list[str] | None) -> tuple[list[str], list[str]]:
-        """读取文件可归属的 Neo4j 实体和三元组，补足 PG 提及丢失的半成品。"""
-        label = safe_neo4j_label(kb_id)
-        with self.driver.session() as session:
-            rows = session.run(
-                f"MATCH (c:Chunk:MilvusKB:`{label}` {{kb_id: $kb_id, file_id: $file_id}})-[:MENTIONS]->(e:Entity) "
-                "WHERE $chunk_ids IS NULL OR c.chunk_id IN $chunk_ids RETURN DISTINCT 'entity' AS kind, e.entity_id AS id "
-                "UNION "
-                "MATCH ()-[r:RELATION {kb_id: $kb_id, file_id: $file_id}]->() "
-                "WHERE $chunk_ids IS NULL OR r.chunk_id IN $chunk_ids RETURN DISTINCT 'triple' AS kind, r.triple_id AS id",
-                kb_id=kb_id,
-                file_id=file_id,
-                chunk_ids=chunk_ids,
-            )
-            entity_ids, triple_ids = [], []
-            for row in rows:
-                if row["id"]:
-                    target = entity_ids if row["kind"] == "entity" else triple_ids
-                    target.append(row["id"])
-            return entity_ids, triple_ids
+        """读取文件可归属的实体和三元组，补足 PG 提及丢失的半成品。"""
+        kb = ngql_literal(kb_id)
+        file_ref = ngql_literal(file_id)
+        chunk_scope = f" AND {self._in_list('c.Node.chunk_id', chunk_ids)}" if chunk_ids is not None else ""
+        entity_rows = self._rows(
+            f"MATCH (c:Node)-[:MENTIONS]->(e:Node) WHERE c.Node.kb_id == {kb} AND c.Node.file_id == {file_ref}{chunk_scope} "
+            "RETURN DISTINCT e.Node.entity_id AS id"
+        )
+        relation_scope = f" AND {self._in_list('r.chunk_id', chunk_ids)}" if chunk_ids is not None else ""
+        triple_rows = self._rows(
+            f"MATCH (a:Node)-[r:RELATION]->(b:Node) WHERE r.kb_id == {kb} AND r.file_id == {file_ref}{relation_scope} "
+            "RETURN DISTINCT r.triple_id AS id"
+        )
+        return (
+            [row["id"] for row in entity_rows if row["id"]],
+            [row["id"] for row in triple_rows if row["id"]],
+        )
 
-    def _delete_file_graph_from_neo4j(
+    def _delete_file_graph_from_graph(
         self, kb_id: str, file_id: str, chunk_ids: list[str] | None, restored_entities: list[dict] | None = None
     ) -> None:
-        label = safe_neo4j_label(kb_id)
+        """删掉文件的关系边、提及边、chunk 顶点，并清理失去全部提及的实体。"""
+        kb = ngql_literal(kb_id)
+        file_ref = ngql_literal(file_id)
+        chunk_scope = f" AND {self._in_list('r.chunk_id', chunk_ids)}" if chunk_ids is not None else ""
 
-        def query(tx):
-            tx.run(
-                f"""
-                MATCH (:Entity:MilvusKB:`{label}`)-[r:RELATION {{kb_id: $kb_id, file_id: $file_id}}]->
-                    (:Entity:MilvusKB:`{label}`)
-                WHERE $chunk_ids IS NULL OR r.chunk_id IN $chunk_ids
-                DELETE r
-                """,
-                kb_id=kb_id,
-                file_id=file_id,
-                chunk_ids=chunk_ids,
-            )
-            tx.run(
-                f"""
-                MATCH (:Chunk:MilvusKB:`{label}` {{kb_id: $kb_id, file_id: $file_id}})-[m:MENTIONS]->
-                    (e:Entity:MilvusKB:`{label}`)
-                WHERE $chunk_ids IS NULL OR m.chunk_id IN $chunk_ids
-                DELETE m
-                WITH DISTINCT e
-                WHERE NOT ()-[:MENTIONS]->(e)
-                DETACH DELETE e
-                """,
-                kb_id=kb_id,
-                file_id=file_id,
-                chunk_ids=chunk_ids,
-            )
-            tx.run(
-                f"""
-                MATCH (c:Chunk:MilvusKB:`{label}` {{kb_id: $kb_id, file_id: $file_id}})
-                WHERE $chunk_ids IS NULL OR c.chunk_id IN $chunk_ids
-                DETACH DELETE c
-                """,
-                kb_id=kb_id,
-                file_id=file_id,
-                chunk_ids=chunk_ids,
+        for row in self._rows(
+            f"MATCH (a:Node)-[r:RELATION]->(b:Node) WHERE r.kb_id == {kb} AND r.file_id == {file_ref}{chunk_scope} "
+            "RETURN src(r) AS source, dst(r) AS target, rank(r) AS rank"
+        ):
+            self.connection.execute(
+                f"DELETE EDGE RELATION {ngql_literal(row['source'])}->{ngql_literal(row['target'])}@{row['rank']}"
             )
 
-            for entity in restored_entities or []:
-                tx.run(
-                    f"MATCH (e:Entity:MilvusKB:`{label}` {{entity_id: $entity_id}}) "
-                    "SET e.name=$name, e.attributes=$attributes, e.source_chunk_id=$source_chunk_id",
-                    entity_id=entity["entity_id"],
-                    name=entity["name"],
-                    attributes=json.dumps(entity["attributes"], ensure_ascii=False),
-                    source_chunk_id=entity["source_chunk_id"],
+        mention_scope = f" AND {self._in_list('r.chunk_id', chunk_ids)}" if chunk_ids is not None else ""
+        mention_rows = self._rows(
+            f"MATCH (c:Node)-[r:MENTIONS]->(e:Node) WHERE c.Node.kb_id == {kb} AND c.Node.file_id == {file_ref}{mention_scope} "
+            "RETURN src(r) AS source, dst(r) AS target, rank(r) AS rank, dst(r) AS entity"
+        )
+        for row in mention_rows:
+            self.connection.execute(
+                f"DELETE EDGE MENTIONS {ngql_literal(row['source'])}->{ngql_literal(row['target'])}@{row['rank']}"
+            )
+
+        # 只剩孤立实体时才删顶点，仍被其他 chunk 提及的实体必须保留
+        candidates = {row["entity"] for row in mention_rows}
+        if candidates:
+            still_mentioned = {
+                row["entity"]
+                for row in self._rows(
+                    f"MATCH (e:Node)<-[:MENTIONS]-(c:Node) WHERE {self._in_list('id(e)', sorted(candidates))} "
+                    "RETURN DISTINCT id(e) AS entity"
                 )
+            }
+            orphans = sorted(candidates - still_mentioned)
+            if orphans:
+                self.connection.execute("DELETE VERTEX " + ", ".join(ngql_literal(vid) for vid in orphans) + " WITH EDGE")
 
-        neo4j_write(self.driver, query)
+        chunk_filter = self._in_list("n.Node.chunk_id", chunk_ids) if chunk_ids is not None else "true"
+        chunk_vids = [
+            row["vid"]
+            for row in self._rows(
+                f'MATCH (n:Node) WHERE n.Node.kb_id == {kb} AND n.Node.file_id == {file_ref} AND n.Node.kind == "Chunk" '
+                f"AND {chunk_filter} RETURN id(n) AS vid"
+            )
+            if row["vid"]
+        ]
+        if chunk_vids:
+            self.connection.execute("DELETE VERTEX " + ", ".join(ngql_literal(vid) for vid in chunk_vids) + " WITH EDGE")
+
+        for entity in restored_entities or []:
+            self.connection.execute(
+                f"UPDATE VERTEX ON Node {ngql_literal(entity_vid(kb_id, entity['entity_id']))} SET "
+                f"Node.name = {ngql_literal(entity['name'])}, "
+                f"Node.attributes = {ngql_literal(json.dumps(entity['attributes'], ensure_ascii=False))}, "
+                f"Node.source_chunk_id = {ngql_literal(entity['source_chunk_id']) if entity['source_chunk_id'] else 'NULL'}"
+            )
 
     # ─── 内部辅助：校验、投影与 Cypher/结果处理 ────────────────────
 
@@ -1229,7 +1238,7 @@ class KnowledgeGraphService:
         return None, 0
 
     async def _filter_visible_subgraph(self, kb_id: str, result: dict[str, Any]) -> dict[str, Any]:
-        """Neo4j 尚未完成清理时，也不能发布 PG 已不可见的内容。"""
+        """图库尚未完成清理时，也不能发布 PG 已不可见的内容。"""
         chunk_ids = {n["properties"]["chunk_id"] for n in result["nodes"] if n["properties"].get("chunk_id")}
         chunk_ids.update(e["properties"]["chunk_id"] for e in result["edges"] if e["properties"].get("chunk_id"))
         chunk_ids.update(n["properties"]["source_chunk_id"] for n in result["nodes"] if n["properties"].get("source_chunk_id"))
@@ -1257,104 +1266,6 @@ class KnowledgeGraphService:
         return {"nodes": nodes, "edges": edges}
 
     @staticmethod
-    def _build_where(exclude_chunk: bool, keyword: str) -> str:
-        clauses = []
-        if exclude_chunk:
-            clauses.append("NOT n:Chunk")
-        if keyword and keyword != "*":
-            clauses.append(
-                "(toLower(coalesce(n.name, '')) CONTAINS toLower($keyword)"
-                " OR toLower(coalesce(n.content_preview, '')) CONTAINS toLower($keyword)"
-                " OR toLower(coalesce(n.chunk_id, '')) CONTAINS toLower($keyword))"
-            )
-        return "WHERE " + " AND ".join(clauses) if clauses else ""
-
-    def _build_query(self, label: str, keyword: str, max_depth: int, exclude_chunk: bool = False) -> str:
-        where = self._build_where(exclude_chunk, keyword)
-
-        if max_depth <= 0:
-            return f"""
-            MATCH (n:MilvusKB:`{label}`)
-            {where}
-            RETURN n AS h, null AS r, null AS t
-            LIMIT $limit
-            """
-
-        path_node_filter = f"path_node:MilvusKB AND path_node:`{label}`"
-        if exclude_chunk:
-            path_node_filter += " AND NOT path_node:Chunk"
-
-        return f"""
-        MATCH (n:MilvusKB:`{label}`)
-        {where}
-        WITH n LIMIT $limit
-        WITH collect(n) AS seeds
-        UNWIND seeds AS seed
-        OPTIONAL MATCH p = (seed)-[*1..{max_depth}]-(m:MilvusKB:`{label}`)
-        WHERE all(path_node IN nodes(p) WHERE {path_node_filter})
-        WITH seeds, p
-        LIMIT $path_limit
-        WITH seeds, collect(p) AS paths
-        RETURN reduce(path_nodes = [], path IN paths | path_nodes + nodes(path)) + seeds AS nodes,
-               reduce(path_edges = [], path IN paths | path_edges + relationships(path)) AS edges
-        """
-
-    def _process_query_result(self, result, limit: int, kb_id: str, exclude_chunk: bool = False) -> dict[str, Any]:
-        nodes = []
-        edges = []
-        node_ids = set()
-        edge_ids = set()
-
-        for record in result:
-            for key in ("h", "t"):
-                raw_node = record.get(key)
-                if raw_node is None:
-                    continue
-                node = self._normalize_node(raw_node, kb_id)
-                if not node or node["id"] in node_ids:
-                    continue
-                if exclude_chunk and node.get("type") == "Chunk":
-                    continue
-                nodes.append(node)
-                node_ids.add(node["id"])
-            raw_edge = record.get("r")
-            if raw_edge is not None:
-                edge = self._normalize_edge(raw_edge)
-                if edge and edge["id"] not in edge_ids:
-                    edges.append(edge)
-                    edge_ids.add(edge["id"])
-            if len(nodes) >= limit:
-                break
-
-        return self._finalize_subgraph_result(nodes, edges, limit)
-
-    def _process_subgraph_record(self, record: Any, limit: int, kb_id: str) -> dict[str, Any]:
-        nodes = []
-        edges = []
-        node_ids = set()
-        edge_ids = set()
-
-        for raw_node in record.get("nodes") or []:
-            node = self._normalize_node(raw_node, kb_id)
-            if not node or node["id"] in node_ids:
-                continue
-            nodes.append(node)
-            node_ids.add(node["id"])
-            if len(nodes) >= limit:
-                break
-
-        for raw_edge in record.get("edges") or []:
-            edge = self._normalize_edge(raw_edge)
-            if not edge or edge["id"] in edge_ids:
-                continue
-            if edge["source_id"] not in node_ids or edge["target_id"] not in node_ids:
-                continue
-            edges.append(edge)
-            edge_ids.add(edge["id"])
-
-        return self._finalize_subgraph_result(nodes, edges, limit)
-
-    @staticmethod
     def _finalize_subgraph_result(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], limit: int) -> dict[str, Any]:
         limit = max(0, limit)
         final_nodes = nodes[:limit]
@@ -1363,16 +1274,11 @@ class KnowledgeGraphService:
         return {"nodes": final_nodes, "edges": final_edges[: limit * 2]}
 
     def _normalize_node(self, raw_node: Any, kb_id: str | None = None) -> dict[str, Any]:
-        if hasattr(raw_node, "element_id"):
-            node_id = raw_node.element_id
-            labels = list(raw_node.labels)
-            properties = dict(raw_node.items())
-        elif isinstance(raw_node, dict):
-            node_id = raw_node.get("id") or raw_node.get("element_id")
-            labels = raw_node.get("labels", [])
-            properties = raw_node.get("properties") or {k: v for k, v in raw_node.items() if k not in {"id", "labels"}}
-        else:
+        if not isinstance(raw_node, dict):
             return {}
+        node_id = raw_node.get("id")
+        labels = raw_node.get("labels") or []
+        properties = raw_node.get("properties") or {}
 
         effective_kb_id = kb_id or self.kb_id
         kb_label = properties.get("kb_id") or effective_kb_id
@@ -1395,21 +1301,13 @@ class KnowledgeGraphService:
         }
 
     def _normalize_edge(self, raw_edge: Any) -> dict[str, Any]:
-        if hasattr(raw_edge, "element_id"):
-            edge_id = raw_edge.element_id
-            edge_type = raw_edge.type
-            source_id = raw_edge.start_node.element_id
-            target_id = raw_edge.end_node.element_id
-            properties = dict(raw_edge.items())
-            edge_type = properties.get("type") or edge_type
-        elif isinstance(raw_edge, dict):
-            edge_id = raw_edge.get("id")
-            edge_type = raw_edge.get("type")
-            source_id = raw_edge.get("source_id")
-            target_id = raw_edge.get("target_id")
-            properties = raw_edge.get("properties", {})
-        else:
+        if not isinstance(raw_edge, dict):
             return {}
+        edge_id = raw_edge.get("id")
+        edge_type = raw_edge.get("type")
+        source_id = raw_edge.get("source_id")
+        target_id = raw_edge.get("target_id")
+        properties = raw_edge.get("properties", {})
 
         return {
             "id": edge_id,

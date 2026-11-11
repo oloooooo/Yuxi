@@ -52,7 +52,7 @@ async def test_parsed_csv_qa_keeps_only_data_rows_and_source_lines(tmp_path):
 )
 async def test_graph_storage_failure_is_not_an_empty_success(monkeypatch, method, kwargs):
     """查询存储不可用时保留失败语义。"""
-    monkeypatch.setattr(graph_module, "run_neo4j_query_io", AsyncMock(side_effect=ConnectionError("graph unavailable")))
+    monkeypatch.setattr(graph_module, "run_nebula_query_io", AsyncMock(side_effect=ConnectionError("graph unavailable")))
     service = KnowledgeGraphService()
     with pytest.raises(ConnectionError, match="graph unavailable"):
         await getattr(service, method)("kb", **kwargs)

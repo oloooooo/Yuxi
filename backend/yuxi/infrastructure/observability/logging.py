@@ -91,7 +91,7 @@ def _setup_logging_bridge() -> None:
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     loguru_handler.setFormatter(formatter)
 
-    for lib in ("httpx", "openai", "neo4j", "urllib3"):
+    for lib in ("httpx", "openai", "nebula3", "urllib3"):
         lib_logger = logging.getLogger(lib)
         lib_logger.addHandler(loguru_handler)
         lib_logger.setLevel(logging.WARNING)

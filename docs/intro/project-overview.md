@@ -35,7 +35,7 @@ Milvus 知识库支持文档上传、解析、分块和索引，提供向量、B
 
 ### 知识图谱
 
-管理员在 Milvus 知识库详情页配置抽取模型并提交构建任务，系统从已索引的文档块中抽取实体和关系并写入 Neo4j。图谱完成后可以查询、浏览关联，并与文本块检索融合，见[知识图谱](../advanced/knowledge-base-graph.md)。
+管理员在 Milvus 知识库详情页配置抽取模型并提交构建任务，系统从已索引的文档块中抽取实体和关系并写入 NebulaGraph。图谱完成后可以查询、浏览关联，并与文本块检索融合，见[知识图谱](../advanced/knowledge-base-graph.md)。
 
 ### 团队治理
 
@@ -59,7 +59,7 @@ Worker 执行 LangGraph，写入事件和最终结果
 PostgreSQL 保存状态，前端通过 SSE 获取过程
 ```
 
-这些组件的分工是：PostgreSQL 保存业务状态、知识库元数据和 LangGraph checkpoint，Redis 负责投递、短期事件、取消信号和缓存，MinIO 保存对象文件，Milvus 提供向量检索，Neo4j 保存可选的知识图谱。各组件在运行链路中的具体职责见[机制详解](../mechanisms/index.md)。
+这些组件的分工是：PostgreSQL 保存业务状态、知识库元数据和 LangGraph checkpoint，Redis 负责投递、短期事件、取消信号和缓存，MinIO 保存对象文件，Milvus 提供向量检索，NebulaGraph 保存可选的知识图谱。各组件在运行链路中的具体职责见[机制详解](../mechanisms/index.md)。
 
 ## 部署与沙盒
 
@@ -75,7 +75,7 @@ PostgreSQL 保存状态，前端通过 SSE 获取过程
 | API 与运行时 | FastAPI、LangGraph、ARQ | 请求接入、智能体编排和后台执行 |
 | 持久化 | PostgreSQL | 业务状态、知识库元数据和 checkpoint |
 | 缓存与事件 | Redis | 投递、短期事件、取消和缓存 |
-| 对象与检索 | MinIO、Milvus、Neo4j | 文件对象、向量索引和知识图谱 |
+| 对象与检索 | MinIO、Milvus、NebulaGraph | 文件对象、向量索引和知识图谱 |
 | 文档处理 | MinerU、PaddleOCR、docling、RapidOCR 等 | 文档解析、版面分析和 OCR |
 | 部署 | Docker Compose | 开发与单机部署拓扑 |
 

@@ -46,8 +46,7 @@ YUXI_MINIO_API_PORT=29000
 YUXI_MINIO_CONSOLE_PORT=29001
 YUXI_MILVUS_PORT=29530
 YUXI_MILVUS_HEALTH_PORT=29091
-YUXI_NEO4J_HTTP_PORT=27474
-YUXI_NEO4J_BOLT_PORT=27687
+YUXI_NEBULA_PORT=29669
 ```
 
 使用 `all` profile 时，再设置 `YUXI_MINERU_PORT`。
@@ -74,7 +73,7 @@ docker compose down  # 停止并保留数据
 - 一个运行中的槽位只允许一套 API、worker 和 `app-init` 写入。
 - 同一槽位可以在执行 `docker compose down` 后交给兼容分支使用。
 - Schema 不兼容时创建新槽位，不修改 `yuxi_schema_migrations` 伪装兼容。
-- 知识库同时依赖 PostgreSQL、MinIO、Milvus 和 Neo4j；复制时必须在停机后备份整套状态。
+- 知识库同时依赖 PostgreSQL、MinIO、Milvus 和 NebulaGraph；复制时必须在停机后备份整套状态。
 - 不提交 `.env` 或状态目录，不对需要保留的槽位执行 `docker compose down -v`。
 - 未经明确授权，Agent 不得删除 volume、状态目录、`.env` 或生产数据。
 

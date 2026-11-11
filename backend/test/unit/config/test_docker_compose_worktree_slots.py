@@ -14,8 +14,7 @@ PORT_MARKERS = {
     "api": {"${YUXI_API_PORT:-5050}:5050"},
     "frontend": {"${YUXI_FRONTEND_PORT:-5173}:5173"},
     "graph": {
-        "127.0.0.1:${YUXI_NEO4J_HTTP_PORT:-7474}:7474",
-        "127.0.0.1:${YUXI_NEO4J_BOLT_PORT:-7687}:7687",
+        "127.0.0.1:${YUXI_NEBULA_PORT:-9669}:9669",
     },
     "minio": {
         "127.0.0.1:${YUXI_MINIO_API_PORT:-9000}:9000",
@@ -86,7 +85,7 @@ def test_development_compose_is_parameterized_for_parallel_worktree_slots() -> N
     assert f"{STATE_ROOT}/postgresql" in state_sources
     assert f"{STATE_ROOT}/redis" in state_sources
     assert f"{STATE_ROOT}/milvus/milvus" in state_sources
-    assert f"{STATE_ROOT}/neo4j/data" in state_sources
+    assert f"{STATE_ROOT}/nebula/meta" in state_sources
     assert f"{STATE_ROOT}/yuxi/threads" in state_sources
 
 

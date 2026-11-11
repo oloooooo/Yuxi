@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from fastapi import FastAPI
-from neo4j import GraphDatabase
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from test.integration.support.postgres_schema import create_isolated_manager, drop_isolated_schema
@@ -154,23 +153,23 @@ async def test_low_recall_http_includes_old_and_new_empty_retrieval(evaluation_d
 
 @pytest.mark.parametrize("endpoint", ["subgraph", "labels", "stats"])
 async def test_graph_http_exposes_unreachable_storage(monkeypatch, endpoint):
-    """真实 Neo4j 连接失败经正式 HTTP 路由返回失败，不能伪装为空图。"""
-    driver = GraphDatabase.driver("bolt://127.0.0.1:1", auth=None, connection_timeout=0.2, max_transaction_retry_time=0)
-    service = KnowledgeGraphService(kb_id="kb", neo4j_connection=SimpleNamespace(driver=driver))
+    """图库不可达经正式 HTTP 路由返回失败，不能伪装为空图。"""
+
+    def execute(_ngql: str) -> list:
+        raise RuntimeError("图库不可用")
+
+    service = KnowledgeGraphService(kb_id="kb", nebula_connection=SimpleNamespace(execute=execute))
 
     async def get_service(kb_id):
-        """已授权知识库使用本例独占的不可达 Neo4j 连接。"""
+        """已授权知识库使用本例独占的不可达图库连接。"""
         return service
 
     monkeypatch.setattr(graph_router, "_get_graph_service", get_service)
     app = FastAPI()
     app.include_router(graph_router.graph, prefix="/api")
     app.dependency_overrides[require_knowledge_base_read] = lambda: object()
-    try:
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.get(f"/api/graph/{endpoint}", params={"kb_id": "kb"})
-        assert response.status_code == 500
-        assert "detail" in response.json()
-        assert "data" not in response.json()
-    finally:
-        await asyncio.to_thread(driver.close)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/api/graph/{endpoint}", params={"kb_id": "kb"})
+    assert response.status_code == 500
+    assert "detail" in response.json()
+    assert "data" not in response.json()

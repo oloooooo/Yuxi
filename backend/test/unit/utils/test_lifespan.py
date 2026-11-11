@@ -109,7 +109,7 @@ async def test_required_startup_component_failure_still_releases_every_runtime_c
 
     assert app.state.startup_components == {"default_agents": {"status": "error", "required": True, "code": "RuntimeError"}}
     assert "password" not in str(exc_info.value)
-    assert released == ["queue_clients", "neo4j", "postgres"]
+    assert released == ["queue_clients", "nebula", "postgres"]
 
 
 async def test_invalid_oidc_configuration_blocks_startup_before_database(monkeypatch):

@@ -27,7 +27,7 @@ from yuxi.shared.errors import InvalidOperationError, ResourceNotFoundError, Sta
 class KnowledgeGraphRepository:
     """知识图谱 PG 投影仓储：实体/三元组/提及的持久化查询与写入、向量租约与两阶段构建状态。
 
-    Neo4j 与 Milvus 侧的图谱操作由 graphs/service.py 编排，本类只拥有 PG 投影事实。
+    图库与 Milvus 侧的图谱操作由 graphs/service.py 编排，本类只拥有 PG 投影事实。
     """
 
     # 向量回填达到该尝试次数后进入 failed 终态，只能经 reconcile 重新入队。
@@ -478,7 +478,7 @@ class KnowledgeGraphRepository:
             return [dict(row._mapping) for row in rows]
 
     async def delete_orphan_records(self, *, entity_ids: list[str], triple_ids: list[str]) -> None:
-        """先提交历史无引用记录的撤销，Neo4j 保留文件归属直到外部清理成功。"""
+        """先提交历史无引用记录的撤销，图库保留文件归属直到外部清理成功。"""
         async with pg_manager.get_async_session_context() as session:
             await self._delete_orphan_records(session, entity_ids=entity_ids, triple_ids=triple_ids)
 
@@ -511,7 +511,7 @@ class KnowledgeGraphRepository:
                 (await session.execute(select(KnowledgeGraphTripleMention.triple_id).where(triple_scope).distinct())).scalars().all()
             )
 
-            # 历史上 Chunk 可能先被删除，Neo4j 文件来源补足已被级联删除的提及归属。
+            # 历史上 Chunk 可能先被删除，图库文件来源补足已被级联删除的提及归属。
             affected_entity_ids = list(set(affected_entity_ids) | set(additional_entity_ids or []))
             affected_triple_ids = list(set(affected_triple_ids) | set(additional_triple_ids or []))
 
@@ -524,7 +524,7 @@ class KnowledgeGraphRepository:
                 session, entity_ids=affected_entity_ids, triple_ids=affected_triple_ids
             )
 
-            # 事务跨 yield 保持打开：外部 Neo4j/Milvus 清理失败时异常抛回本上下文，PG 删除整体回滚。
+            # 事务跨 yield 保持打开：外部图库/Milvus 清理失败时异常抛回本上下文，PG 删除整体回滚。
             yield orphan_entity_ids, orphan_triple_ids, chunk_ids
             for entity in restored_entities or []:
                 await session.execute(

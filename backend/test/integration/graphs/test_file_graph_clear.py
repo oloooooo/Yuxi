@@ -1,4 +1,4 @@
-"""文件图谱撤销的真实 PostgreSQL、Neo4j 与投影并发契约。"""
+"""文件图谱撤销的真实 PostgreSQL、图库与投影并发契约。"""
 
 import asyncio
 import json
@@ -12,8 +12,9 @@ from sqlalchemy import insert, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from test.integration.graphs.nebula_graph import chunk_count, drop_kb, entity_props, relation_file_ids
 from test.integration.support.postgres_schema import create_isolated_manager, drop_isolated_schema
-from yuxi.infrastructure.neo4j import safe_neo4j_label
+from yuxi.infrastructure.nebula import get_shared_nebula_connection
 from yuxi.migrations.schema import create_knowledge_tables
 from yuxi.modules.background_jobs import repository as job_repository
 from yuxi.modules.background_jobs.models import BackgroundJobRecord
@@ -35,7 +36,6 @@ async def graph_data(monkeypatch):
     schema, admin, engine, manager = await create_isolated_manager("pytest_file_graph_clear")
     manager.AsyncSession = async_sessionmaker(engine, expire_on_commit=False)
     kb_id = f"pytest_clear_{uuid4().hex}"
-    label = safe_neo4j_label(kb_id)
     for module in (bases, chunks, document_resets, graphs, projections):
         monkeypatch.setattr(module, "pg_manager", manager)
     vector_store = SimpleNamespace(delete_graph_records=AsyncMock())
@@ -87,10 +87,9 @@ async def graph_data(monkeypatch):
             await service.graph_repo.upsert_chunk_graph(
                 kb_id=kb_id, file_id=file_id, chunk_id=chunk.chunk_id, entities=entities, triples=triples
             )
-        yield SimpleNamespace(service=service, engine=engine, kb_id=kb_id, label=label, vectors=vector_store)
+        yield SimpleNamespace(service=service, engine=engine, kb_id=kb_id, vectors=vector_store)
     finally:
-        with service.driver.session() as session:
-            session.run(f"MATCH (n:MilvusKB:`{label}`) DETACH DELETE n").consume()
+        drop_kb(get_shared_nebula_connection(), kb_id)
         await drop_isolated_schema(schema, admin, engine)
 
 
@@ -98,20 +97,20 @@ async def test_clear_preserves_shared_graph_and_restores_surviving_attributes(gr
     """向量阶段未完成仍清理，失败回滚后重试，并从剩余提及恢复共享属性。"""
     data = graph_data
     service, kb_id = data.service, data.kb_id
-    # 模拟历史缺陷留下的纯 Neo4j 半成品：对应 PG Chunk 已被删除。
+    # 模拟历史缺陷留下的纯图库半成品：对应 PG Chunk 已被删除。
     orphan = SimpleNamespace(chunk_id="gone", file_id="b", chunk_index=9, content="old", start_char_pos=0, end_char_pos=3)
     await asyncio.to_thread(
         service.write_chunk_graph, kb_id, orphan, normalize_extraction_result({"entities": [{"text": "Orphan"}], "relations": []}, "llm")
     )
-    original_delete = service._delete_file_graph_from_neo4j
+    original_delete = service._delete_file_graph_from_graph
     with monkeypatch.context() as scoped:
-        scoped.setattr(service, "_delete_file_graph_from_neo4j", lambda *args: (_ for _ in ()).throw(RuntimeError("neo4j unavailable")))
-        with pytest.raises(RuntimeError, match="neo4j unavailable"):
+        scoped.setattr(service, "_delete_file_graph_from_graph", lambda *args: (_ for _ in ()).throw(RuntimeError("图库不可用")))
+        with pytest.raises(RuntimeError, match="图库不可用"):
             await service.clear_file_graph(kb_id, "b", generation=1)
     async with data.engine.connect() as conn:
         assert await conn.scalar(text("SELECT count(*) FROM knowledge_graph_entity_mentions WHERE file_id='b'")) == 3
         assert await conn.scalar(text("SELECT extraction_result FROM knowledge_chunks WHERE chunk_id='cb'")) is not None
-    assert service._delete_file_graph_from_neo4j == original_delete
+    assert service._delete_file_graph_from_graph == original_delete
     monkeypatch.setattr(background_jobs, "KnowledgeGraphService", lambda: service)
     context = SimpleNamespace(
         payload={"kb_id": kb_id, "action": "clear_file", "file_id": "b", "generation": 1},
@@ -139,12 +138,12 @@ async def test_clear_preserves_shared_graph_and_restores_surviving_attributes(gr
         entity = (await conn.execute(text("SELECT name,attributes FROM knowledge_graph_entities WHERE normalized_name='alpha'"))).one()
         assert entity.name == "Alpha" and entity.attributes == [{"text": "from-a", "label": "Attribute"}]
         assert await conn.scalar(text("SELECT count(*) FROM knowledge_graph_entities")) == 3
-    with service.driver.session() as session:
-        assert session.run(f"MATCH (c:Chunk:MilvusKB:`{data.label}` {{file_id:'b'}}) RETURN count(c) AS n").single()["n"] == 0
-        node = session.run(f"MATCH (e:Entity:MilvusKB:`{data.label}` {{normalized_name:'alpha'}}) RETURN properties(e) AS e").single()["e"]
-        assert node["source_chunk_id"] == "ca" and json.loads(node["attributes"]) == [{"text": "from-a", "label": "Attribute"}]
-        assert session.run(f"MATCH (e:Entity:MilvusKB:`{data.label}` {{normalized_name:'orphan'}}) RETURN count(e) AS n").single()["n"] == 0
-        assert session.run("MATCH ()-[r:RELATION {kb_id:$kb}]->() RETURN collect(r.file_id) AS files", kb=kb_id).single()["files"] == ["a"]
+    connection = get_shared_nebula_connection()
+    assert chunk_count(connection, kb_id, file_id="b") == 0
+    alpha = entity_props(connection, kb_id, "alpha")
+    assert alpha["source_chunk_id"] == "ca" and json.loads(alpha["attributes"]) == [{"text": "from-a", "label": "Attribute"}]
+    assert entity_props(connection, kb_id, "orphan") is None
+    assert relation_file_ids(connection, kb_id) == ["a"]
     # 保留的抽取正文足以再次构建，没有沿用被清除的缓存结果。
     payload = normalize_extraction_result({"entities": [{"text": "Rebuilt"}], "relations": []}, "llm")
     chunk = await service.chunk_repo.get_by_chunk_id("cb")
@@ -253,11 +252,10 @@ async def test_clear_rechecks_owner_after_waiting_for_projection_lock(graph_data
     async with data.engine.connect() as conn:
         assert await conn.scalar(text("SELECT count(*) FROM knowledge_graph_entity_mentions WHERE file_id='b'")) == 3
         assert await conn.scalar(text("SELECT extraction_result FROM knowledge_chunks WHERE chunk_id='cb'")) == original_extraction
-    with data.service.driver.session() as session:
-        assert session.run(f"MATCH (c:Chunk:MilvusKB:`{data.label}` {{file_id:'b'}}) RETURN count(c) AS n").single()["n"] == 1
+    assert chunk_count(get_shared_nebula_connection(), data.kb_id, file_id="b") == 1
 
 
-@pytest.mark.parametrize("failure_stage", ["pg_commit", "vectors", "after_neo4j"])
+@pytest.mark.parametrize("failure_stage", ["pg_commit", "vectors", "after_graph"])
 async def test_clear_recovers_historical_orphans_across_failure_windows(graph_data, monkeypatch, failure_stage):
     """历史 Chunk 已丢失时仍按文件来源清孤儿，任一提交窗口失败后可以完整重放。"""
     from sqlalchemy import event
@@ -306,12 +304,12 @@ async def test_clear_recovers_historical_orphans_across_failure_windows(graph_da
         if conn.info.pop("fail_orphan_commit", False):
             raise RuntimeError("orphan commit failed")
 
-    original_delete = service._delete_file_graph_from_neo4j
+    original_delete = service._delete_file_graph_from_graph
 
-    def fail_after_neo4j(*args):
+    def fail_after_graph(*args):
         """保留外部删除已提交但普通提及事务尚未提交的失败窗口。"""
         original_delete(*args)
-        raise RuntimeError("after neo4j failed")
+        raise RuntimeError("after graph failed")
 
     with monkeypatch.context() as scoped:
         if failure_stage == "pg_commit":
@@ -320,7 +318,7 @@ async def test_clear_recovers_historical_orphans_across_failure_windows(graph_da
         elif failure_stage == "vectors":
             scoped.setattr(data.vectors, "delete_graph_records", AsyncMock(side_effect=RuntimeError("vectors failed")))
         else:
-            scoped.setattr(service, "_delete_file_graph_from_neo4j", fail_after_neo4j)
+            scoped.setattr(service, "_delete_file_graph_from_graph", fail_after_graph)
         try:
             with pytest.raises(RuntimeError, match="failed"):
                 await service.clear_file_graph(data.kb_id, "b", generation=1)
@@ -332,17 +330,15 @@ async def test_clear_recovers_historical_orphans_across_failure_windows(graph_da
         lost_count = await conn.scalar(text("SELECT count(*) FROM knowledge_graph_entities WHERE normalized_name LIKE 'lost %'"))
         assert lost_count == (2 if failure_stage == "pg_commit" else 0)
         assert await conn.scalar(text("SELECT count(*) FROM knowledge_graph_entity_mentions WHERE file_id='b'")) == 3
-    with service.driver.session() as session:
-        lost_count = session.run(f"MATCH (c:Chunk:MilvusKB:`{data.label}` {{chunk_id:'lost'}}) RETURN count(c) AS n").single()["n"]
-        assert lost_count == (0 if failure_stage == "after_neo4j" else 1)
+    lost_count = chunk_count(get_shared_nebula_connection(), data.kb_id, chunk_id="lost")
+    assert lost_count == (0 if failure_stage == "after_graph" else 1)
     await service.clear_file_graph(data.kb_id, "b", generation=1)
     async with data.engine.connect() as conn:
         names = list(await conn.scalars(text("SELECT normalized_name FROM knowledge_graph_entities ORDER BY normalized_name")))
         assert names == ["alpha", "beta", "only a"]
         assert await conn.scalar(text("SELECT count(*) FROM knowledge_graph_triples")) == 1
         assert await conn.scalar(text("SELECT count(*) FROM knowledge_graph_triple_mentions WHERE file_id='b'")) == 0
-    with service.driver.session() as session:
-        assert session.run(f"MATCH (c:Chunk:MilvusKB:`{data.label}` {{file_id:'b'}}) RETURN count(c) AS n").single()["n"] == 0
+    assert chunk_count(get_shared_nebula_connection(), data.kb_id, file_id="b") == 0
 
 
 @pytest.mark.parametrize("trusted_source", [True, False])
@@ -375,7 +371,6 @@ async def test_clear_restores_only_trustworthy_surviving_entity_source(graph_dat
         assert (
             await conn.scalar(text("SELECT attributes FROM knowledge_graph_entities WHERE normalized_name='alpha'")) == expected_attributes
         )
-    with service.driver.session() as session:
-        node = session.run(f"MATCH (e:Entity:MilvusKB:`{data.label}` {{normalized_name:'alpha'}}) RETURN properties(e) AS e").single()["e"]
-        assert json.loads(node["attributes"]) == expected_attributes
-        assert node.get("source_chunk_id") == ("ca" if trusted_source else None)
+    alpha = entity_props(get_shared_nebula_connection(), data.kb_id, "alpha")
+    assert json.loads(alpha["attributes"]) == expected_attributes
+    assert alpha.get("source_chunk_id") == ("ca" if trusted_source else None)

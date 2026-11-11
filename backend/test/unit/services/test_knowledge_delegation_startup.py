@@ -84,7 +84,7 @@ async def test_valid_enabled_config_and_disabled_without_instance_reach_schema(m
         assert app.state.startup_components["security_secrets"] == {"status": "ok", "required": True}
 
 
-@pytest.mark.parametrize("failure", ["milvus", "neo4j"])
+@pytest.mark.parametrize("failure", ["milvus", "nebula"])
 async def test_worker_backend_unready_cannot_publish_or_claim_pending_jobs(monkeypatch, failure):
     """恢复关闭部署时，任何知识后端未就绪都不能先消费持久任务。"""
     monkeypatch.setattr(worker.pg_manager, "initialize", lambda: None)
@@ -100,11 +100,11 @@ async def test_worker_backend_unready_cannot_publish_or_claim_pending_jobs(monke
 
     def connect_graph():
         """模拟真实 Bolt 连接失败。"""
-        calls.append("neo4j")
-        raise ConnectionError("neo4j not ready")
+        calls.append("nebula")
+        raise ConnectionError("nebula not ready")
 
     monkeypatch.setattr("yuxi.modules.knowledge.runtime.knowledge_base.initialize", initialize)
-    monkeypatch.setattr("yuxi.infrastructure.neo4j.get_shared_neo4j_connection", connect_graph)
+    monkeypatch.setattr("yuxi.infrastructure.nebula.get_shared_nebula_connection", connect_graph)
     recover = AsyncMock()
     publish = AsyncMock()
     monkeypatch.setattr(worker, "_reconcile_agent_runs_once", recover)
@@ -114,7 +114,7 @@ async def test_worker_backend_unready_cannot_publish_or_claim_pending_jobs(monke
         await worker.startup(ctx)
     recover.assert_not_awaited()
     publish.assert_not_awaited()
-    assert calls == (["milvus"] if failure == "milvus" else ["milvus", "neo4j"])
+    assert calls == (["milvus"] if failure == "milvus" else ["milvus", "nebula"])
     assert not any(
         key in ctx
         for key in (
@@ -142,7 +142,7 @@ async def test_worker_publishes_only_after_enabled_backends_are_ready(monkeypatc
 
     def connect_graph():
         """记录 Bolt 已可连接。"""
-        calls.append("neo4j")
+        calls.append("nebula")
 
     async def publish():
         """后端就绪后才进入已有的持久任务补发。"""
@@ -150,7 +150,7 @@ async def test_worker_publishes_only_after_enabled_backends_are_ready(monkeypatc
         return []
 
     monkeypatch.setattr("yuxi.modules.knowledge.runtime.knowledge_base.initialize", initialize)
-    monkeypatch.setattr("yuxi.infrastructure.neo4j.get_shared_neo4j_connection", connect_graph)
+    monkeypatch.setattr("yuxi.infrastructure.nebula.get_shared_nebula_connection", connect_graph)
     monkeypatch.setattr(worker, "reconcile_and_publish_jobs", publish)
     for name in (
         "_reconcile_agent_runs_once",
@@ -163,4 +163,4 @@ async def test_worker_publishes_only_after_enabled_backends_are_ready(monkeypatc
     ctx = {}
     await worker.startup(ctx)
     await asyncio.gather(*(value for value in ctx.values() if isinstance(value, asyncio.Task)))
-    assert calls == (["milvus", "neo4j", "publish"] if enabled else ["publish"])
+    assert calls == (["milvus", "nebula", "publish"] if enabled else ["publish"])

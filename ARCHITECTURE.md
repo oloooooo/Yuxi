@@ -6,7 +6,7 @@
 
 ## 鸟瞰
 
-Yuxi 是一个面向 RAG、知识图谱和多智能体工作流的知识库平台。用户通过 Vue 前端管理智能体、知识库、模型、工具、Skills、MCP 与协作会话；前端通过 `/api` 调用 FastAPI；后端服务层协调 PostgreSQL、Redis、MinIO、Milvus、Neo4j、LangGraph 和沙盒。
+Yuxi 是一个面向 RAG、知识图谱和多智能体工作流的知识库平台。用户通过 Vue 前端管理智能体、知识库、模型、工具、Skills、MCP 与协作会话；前端通过 `/api` 调用 FastAPI；后端服务层协调 PostgreSQL、Redis、MinIO、Milvus、NebulaGraph、LangGraph 和沙盒。
 
 普通智能体消息先在 PostgreSQL Input 中保存原始内容，Receipt 保存幂等接收事实。调度器消费就绪输入时原子创建正式 Message、Turn 与首个 Run；steer 优先于 follow-up，运行中在安全边界接续当前 Turn。人工等待恢复沿用当前 Turn，产生下一段 Run。消费事务提交后，pending Run 通过 Redis/ARQ 交给独立 worker 执行。Redis Stream 保存短期增量，PostgreSQL 保存执行和业务终态，前端分别显示待处理队列和正式消息历史。
 
@@ -23,7 +23,7 @@ Yuxi 是一个面向 RAG、知识图谱和多智能体工作流的知识库平�
 - `redis`：ARQ 投递、运行事件、取消信号以及跨进程配置和模型缓存。
 - `minio`：附件草稿内容、知识库原始文件和其他对象数据；正式 Agent 附件归 Workdir，附件事实归 PostgreSQL。
 - `milvus`、`etcd`：向量检索及其元数据协调。
-- `graph`：Neo4j 知识图谱。
+- `graph`：NebulaGraph 知识图谱。
 - `mineru-api`：通过 `all` profile 可选启动的 MinerU 自托管解析服务；PaddleOCR-VL、PP-OCRv6 和 PP-StructureV3 共用官网云服务适配器。
 
 API 在 `/api/mcp` 提供只读知识库 MCP，与 HTTP API 共用进程和端口。`modules/knowledge/mcp` 拥有服务端协议、内部认证、连接定义、产品读取和知识引用转换，API 只装配组件与生命周期。外部客户端使用 API Key，内部 Agent 使用 Knowledge 自己提供的 SDK Auth，按可信运行用户与会话选择签发五分钟凭据；Knowledge 每次调用复核当前用户权限交集。通用 MCP 复用现有工具发现、目录缓存与执行策略，不解释 Knowledge 的范围、Token 或结果结构。`knowledge-base` Skill 以 `mcp_dependencies` 门控；Agent 只调用 Knowledge 的产品函数。选择器与引用读取直接通过 SDK 调用 MCP，引用保留文件身份和行范围。关闭 Knowledge 时不装配路由与 manager，内置身份保留，能力发现和执行明确不可用。
@@ -61,7 +61,7 @@ Yuxi 默认交付完整知识能力。部署开关 `YUXI_KNOWLEDGE_ENABLED` 由�
 
 领域用例使用 `shared/errors.py` 中的失败类型、消息与可选业务 code，API 的 `errors.py` 负责转换为 HTTP 状态及现有 detail 正文。定时执行、文件预览与模型工具直接按领域类型消费失败；持久错误消息使用业务文本。HTTPException 属于 API 适配层。
 
-`infrastructure/postgres` 管理业务 session 与 LangGraph checkpoint pool；`redis` 提供连接，业务 key 与事件语义留在对应模块；`minio`、`neo4j` 和 `oidc` 封装远端客户端；`observability` 封装日志与 Langfuse SDK。`infrastructure/file_preview.py` 准备浏览器展示内容，`infrastructure/office_conversion.py` 独立执行 Office 到 PDF 转换；Workspace 与 Knowledge 拥有各自的预览缓存。`shared` 只保存不依赖业务域与 HTTP 的小型公共契约与通用逻辑，`shared/files.py` 拥有文件输入、文件结果、MIME 识别与共用原文件预览预算；各预览读取用例把预算传给文件或对象存储边界执行有界读取。`infrastructure/crypto.py` 读取部署级 Fernet 凭据密钥，业务域拥有加密载荷与领域错误；`infrastructure/runtime_settings.py` 管理进程环境、公开站点来源与运行目录；system 模块拥有品牌模板和持久系统配置。`api/responses` 负责文件与知识响应，业务服务提供已经授权的读取结果。
+`infrastructure/postgres` 管理业务 session 与 LangGraph checkpoint pool；`redis` 提供连接，业务 key 与事件语义留在对应模块；`minio`、`nebula` 和 `oidc` 封装远端客户端；`observability` 封装日志与 Langfuse SDK。`infrastructure/file_preview.py` 准备浏览器展示内容，`infrastructure/office_conversion.py` 独立执行 Office 到 PDF 转换；Workspace 与 Knowledge 拥有各自的预览缓存。`shared` 只保存不依赖业务域与 HTTP 的小型公共契约与通用逻辑，`shared/files.py` 拥有文件输入、文件结果、MIME 识别与共用原文件预览预算；各预览读取用例把预算传给文件或对象存储边界执行有界读取。`infrastructure/crypto.py` 读取部署级 Fernet 凭据密钥，业务域拥有加密载荷与领域错误；`infrastructure/runtime_settings.py` 管理进程环境、公开站点来源与运行目录；system 模块拥有品牌模板和持久系统配置。`api/responses` 负责文件与知识响应，业务服务提供已经授权的读取结果。
 
 ### 后台任务
 

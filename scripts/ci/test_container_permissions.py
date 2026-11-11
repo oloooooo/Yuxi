@@ -115,7 +115,7 @@ class ContainerPermissionTests(unittest.TestCase):
                 "API_KEY_DERIVATION_SECRET": "a" * 64,
                 "YUXI_INSTANCE_ID": project,
                 "POSTGRES_PASSWORD": "test-postgres",
-                "NEO4J_PASSWORD": "test-neo4j",
+                "NEBULA_PASSWORD": "test-nebula",
                 "MINIO_ACCESS_KEY": "test-access",
                 "MINIO_SECRET_KEY": "test-secret",
                 "CUBE_API_URL": "http://example.invalid:3000",

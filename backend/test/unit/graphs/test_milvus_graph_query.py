@@ -11,187 +11,225 @@ from yuxi.modules.knowledge.graphs.service import KnowledgeGraphService
 pytestmark = pytest.mark.usefixtures("milvus_graph_projection_lock")
 
 
-def _raw_graph_node(node_id: str, *, labels: list[str] | None = None, name: str | None = None) -> dict:
-    return {
-        "id": node_id,
-        "labels": labels or ["MilvusKB", "Entity"],
-        "properties": {"name": name or node_id, "kb_id": "kb_test"},
-    }
+class _FakeConnection:
+    """记录 nGQL 语句，供断言写入与删除的形状。"""
+
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+
+    def execute(self, ngql: str) -> list:
+        self.statements.append(" ".join(ngql.split()))
+        return []
 
 
-def _raw_graph_edge(edge_id: str, source_id: str, target_id: str) -> dict:
-    return {
-        "id": edge_id,
-        "type": "RELATED_TO",
-        "source_id": source_id,
-        "target_id": target_id,
-        "properties": {},
-    }
+def _service(rows_by_marker: dict[str, list[dict]] | None = None) -> tuple[KnowledgeGraphService, _FakeConnection]:
+    """构造只替换 `_rows` 的服务，其余走真实实现。"""
+    connection = _FakeConnection()
+    service = KnowledgeGraphService(nebula_connection=SimpleNamespace(execute=connection.execute))
+    markers = rows_by_marker or {}
+
+    def rows(ngql: str) -> list[dict]:
+        for marker, rows_value in markers.items():
+            if marker in ngql:
+                return rows_value
+        return []
+
+    service._rows = rows  # type: ignore[method-assign]
+    return service, connection
 
 
-def test_milvus_graph_service_delete_file_graph_uses_scoped_streaming_queries():
-    tx = MagicMock()
-    session = MagicMock()
-    session.__enter__.return_value = session
-    session.execute_write.side_effect = lambda func: func(tx)
-    driver = MagicMock()
-    driver.session.return_value = session
-    service = KnowledgeGraphService(neo4j_connection=SimpleNamespace(driver=driver))
-
-    service._delete_file_graph_from_neo4j("kb_test", "file_1", ["chunk_1"])
-
-    queries = [call.args[0] for call in tx.run.call_args_list]
-    assert len(queries) == 3
-    cleanup_query = queries[1]
-    assert "file_id: $file_id" in cleanup_query
-    assert "DELETE m" in cleanup_query
-    assert "WITH DISTINCT e" in cleanup_query
-    assert "collect(" not in cleanup_query
-    assert "MATCH (e:Entity:MilvusKB:`kb_test` {kb_id: $kb_id})" not in cleanup_query
-    assert "DETACH DELETE c" in queries[2]
-    assert all("IN $chunk_ids" in query for query in queries)
-    assert all(call.kwargs["chunk_ids"] == ["chunk_1"] for call in tx.run.call_args_list)
+def _node(vid: str, kind: str, **properties) -> dict:
+    return {"id": vid, "labels": [kind], "properties": {"kind": kind, "kb_id": "kb_test", **properties}}
 
 
-@pytest.mark.parametrize(
-    ("payload", "limit", "exclude_chunk", "expected_node_ids", "expected_edge_ids"),
-    [
-        (
-            [
-                {
-                    "h": _raw_graph_node("node-a"),
-                    "t": _raw_graph_node("node-b"),
-                    "r": _raw_graph_edge("edge-a-b", "node-a", "node-b"),
-                }
+def test_subgraph_ngql_builds_depth_and_path_filters():
+    service, _ = _service()
+
+    query = " ".join(
+        service._subgraph_ngql("kb_test", ["kb_test:e1"], 2, ['all(x IN nodes(p) WHERE x.Node.chunk_id IN ["c1"])'], 30).split()
+    )
+
+    assert "[*1..2]" in query
+    assert 'all(x IN nodes(p) WHERE x.Node.kb_id == "kb_test")' in query
+    assert "nodes(p)" in query and "relationships(p)" in query
+    assert "LIMIT 30" in query
+
+
+def test_subgraph_from_ngql_dedupes_rows_and_honors_limit():
+    rows = [
+        {
+            "node_ids": ["kb_test:e1", "kb_test:c1"],
+            "node_props": [
+                {"kind": "Entity", "kb_id": "kb_test", "entity_id": "e1", "name": "苹果"},
+                {"kind": "Chunk", "kb_id": "kb_test", "chunk_id": "c1", "content_preview": "苹果很好吃"},
             ],
-            2,
-            False,
-            ["node-a", "node-b"],
-            ["edge-a-b"],
-        ),
-        (
-            [
-                {
-                    "h": _raw_graph_node("node-a"),
-                    "t": _raw_graph_node("node-b"),
-                    "r": _raw_graph_edge("edge-a-b", "node-a", "node-b"),
-                }
-            ],
-            1,
-            False,
-            ["node-a"],
-            [],
-        ),
-        (
-            [
-                {
-                    "h": _raw_graph_node("entity-a"),
-                    "t": _raw_graph_node("chunk-a", labels=["MilvusKB", "Chunk"]),
-                    "r": _raw_graph_edge("edge-entity-chunk", "entity-a", "chunk-a"),
-                }
-            ],
-            2,
-            True,
-            ["entity-a"],
-            [],
-        ),
-        (
-            [
-                {
-                    "h": _raw_graph_node("node-a"),
-                    "t": _raw_graph_node("node-b"),
-                    "r": _raw_graph_edge("edge-a-b", "node-a", "node-b"),
-                }
-            ],
-            -1,
-            False,
-            [],
-            [],
-        ),
-    ],
-)
-def test_milvus_graph_service_process_query_result(payload, limit, exclude_chunk, expected_node_ids, expected_edge_ids):
-    service = KnowledgeGraphService()
-    result = service._process_query_result(payload, limit=limit, kb_id="kb_test", exclude_chunk=exclude_chunk)
+            "edges": [["kb_test:c1", "kb_test:e1", "MENTIONS", 0, {"chunk_id": "c1", "kb_id": "kb_test"}]],
+        },
+        {
+            "node_ids": ["kb_test:e1", "kb_test:c1"],
+            "node_props": [{"kind": "Entity", "kb_id": "kb_test", "entity_id": "e1"}, {"kind": "Chunk"}],
+            "edges": [["kb_test:c1", "kb_test:e1", "MENTIONS", 0, {"chunk_id": "c1"}]],
+        },
+    ]
+    service, _ = _service({"MATCH p=": rows})
 
-    assert [node["id"] for node in result["nodes"]] == expected_node_ids
-    assert [edge["id"] for edge in result["edges"]] == expected_edge_ids
+    result = service._subgraph_from_ngql("MATCH p=...", limit=2)
+
+    assert [node["id"] for node in result["nodes"]] == ["kb_test:e1", "kb_test:c1"]
+    assert result["nodes"][0]["type"] == "Entity" and result["nodes"][1]["type"] == "Chunk"
+    assert result["nodes"][0]["labels"] == ["Entity"]
+    assert [edge["id"] for edge in result["edges"]] == ["kb_test:c1|kb_test:e1|0"]
+    assert result["edges"][0]["type"] == "MENTIONS"
+
+
+def test_subgraph_from_ngql_drops_edges_of_truncated_nodes():
+    rows = [
+        {
+            "node_ids": ["kb_test:e1", "kb_test:e2"],
+            "node_props": [{"kind": "Entity"}, {"kind": "Entity"}],
+            "edges": [["kb_test:e1", "kb_test:e2", "RELATION", 3, {"rel_type": "likes"}]],
+        }
+    ]
+    service, _ = _service({"MATCH p=": rows})
+
+    result = service._subgraph_from_ngql("MATCH p=...", limit=1)
+
+    assert [node["id"] for node in result["nodes"]] == ["kb_test:e1"]
+    assert result["edges"] == []
+
+
+def _depth_of_path_query(service: KnowledgeGraphService, max_depth: int) -> str:
+    """跑一次节点查询，返回生成的变长路径语句。"""
+    queries: list[str] = []
+    inner = service._rows
+    service._rows = lambda ngql: queries.append(" ".join(ngql.split())) or inner(ngql)  # type: ignore[method-assign]
+    service._query_nodes_sync("kb_test", "e1", 3, max_depth, False)
+    return next(query for query in queries if "MATCH p=" in query)
 
 
 @pytest.mark.parametrize("max_depth", [1, 2, 3])
-def test_milvus_graph_service_build_query_uses_requested_depth(max_depth):
-    service = KnowledgeGraphService()
+def test_query_nodes_sync_uses_requested_depth(max_depth):
+    service, _ = _service(_seed_rows())
 
-    query = service._build_query("kb_test", "entity", max_depth=max_depth)
-
-    assert f"[*1..{max_depth}]" in query
-    assert "nodes(path)" in query
-    assert "relationships(path)" in query
-    assert "nodes(path)) + seeds AS nodes" in query
+    assert f"[*1..{max_depth}]" in _depth_of_path_query(service, max_depth)
 
 
-def test_milvus_graph_service_build_query_excludes_chunks_from_entire_path():
-    service = KnowledgeGraphService()
+def test_query_nodes_sync_caps_max_depth_at_three():
+    service, _ = _service(_seed_rows())
 
-    query = service._build_query("kb_test", "entity", max_depth=3, exclude_chunk=True)
-
-    assert "NOT n:Chunk" in query
-    assert "NOT path_node:Chunk" in query
+    assert "[*1..3]" in _depth_of_path_query(service, 100)
 
 
-def test_milvus_graph_service_query_nodes_sync_returns_complete_multi_hop_path():
-    query_result = MagicMock()
-    query_result.single.return_value = {
-        "nodes": [_raw_graph_node("node-a"), _raw_graph_node("node-b"), _raw_graph_node("node-c")],
-        "edges": [
-            _raw_graph_edge("edge-a-b", "node-a", "node-b"),
-            _raw_graph_edge("edge-b-c", "node-b", "node-c"),
-        ],
+def _seed_rows() -> dict[str, list[dict]]:
+    return {
+        "RETURN id(n) AS id, properties(n) AS props": [
+            {"id": "kb_test:e1", "props": {"kind": "Entity", "kb_id": "kb_test", "entity_id": "e1"}}
+        ]
     }
-    session = MagicMock()
-    session.__enter__.return_value = session
-    session.run.return_value = query_result
-    driver = MagicMock()
-    driver.session.return_value = session
-    service = KnowledgeGraphService(neo4j_connection=SimpleNamespace(driver=driver))
 
-    result = service._query_nodes_sync(
-        "kb_test",
-        "kb_test",
-        "node-a",
-        limit=3,
-        max_depth=2,
-        exclude_chunk=False,
+
+def test_seed_vids_selects_by_keyword_and_scope():
+    service, _ = _service(
+        {
+            "RETURN id(n) AS id, properties(n) AS props": [
+                {"id": "kb_test:e1", "props": {"kind": "Entity", "kb_id": "kb_test", "entity_id": "e1", "name": "苹果"}}
+            ]
+        }
     )
 
-    assert [node["id"] for node in result["nodes"]] == ["node-a", "node-b", "node-c"]
-    assert [edge["id"] for edge in result["edges"]] == ["edge-a-b", "edge-b-c"]
-    query, query_params = session.run.call_args
-    assert "[*1..2]" in query[0]
-    assert query_params["path_limit"] == 30
+    seeds = service._seed_vids("kb_test", "苹果", 5, [])
+
+    assert seeds[0]["id"] == "kb_test:e1"
+    assert seeds[0]["name"] == "苹果"
 
 
-def test_milvus_graph_service_query_nodes_sync_caps_max_depth():
-    query_result = MagicMock()
-    query_result.single.return_value = None
-    session = MagicMock()
-    session.__enter__.return_value = session
-    session.run.return_value = query_result
-    driver = MagicMock()
-    driver.session.return_value = session
-    service = KnowledgeGraphService(neo4j_connection=SimpleNamespace(driver=driver))
+def test_in_list_degrades_to_false_for_empty_scope():
+    assert KnowledgeGraphService._in_list("n.Node.chunk_id", []) == "false"
+    assert KnowledgeGraphService._in_list("n.Node.chunk_id", ["c1", "c2"]) == 'n.Node.chunk_id IN ["c1", "c2"]'
 
-    service._query_nodes_sync(
-        "kb_test",
-        "kb_test",
-        "node-a",
-        limit=3,
-        max_depth=100,
-        exclude_chunk=False,
+
+def test_delete_file_graph_keeps_entities_still_mentioned_elsewhere():
+    service, connection = _service(
+        {
+            "-[r:RELATION]->": [{"source": "kb_test:e1", "target": "kb_test:e2", "rank": 7}],
+            "<-[:MENTIONS]-": [{"entity": "kb_test:e1"}],
+            "-[r:MENTIONS]->": [
+                {"source": "kb_test:c1", "target": "kb_test:e1", "rank": 0, "entity": "kb_test:e1"}
+            ],
+            'kind == "Chunk"': [{"vid": "kb_test:c1"}],
+        }
     )
 
-    query, _ = session.run.call_args
-    assert "[*1..3]" in query[0]
+    service._delete_file_graph_from_graph("kb_test", "file_1", ["c1"], restored_entities=None)
+
+    joined = "\n".join(connection.statements)
+    assert 'DELETE EDGE RELATION "kb_test:e1"->"kb_test:e2"@7' in joined
+    assert 'DELETE EDGE MENTIONS "kb_test:c1"->"kb_test:e1"@0' in joined
+    assert 'DELETE VERTEX "kb_test:c1" WITH EDGE' in joined
+    assert "DELETE VERTEX" not in joined.replace('DELETE VERTEX "kb_test:c1" WITH EDGE', "")
+
+
+def test_delete_file_graph_removes_orphan_entities_and_restores_attributes():
+    service, connection = _service(
+        {
+            "-[r:RELATION]->": [],
+            "<-[:MENTIONS]-": [],
+            "-[r:MENTIONS]->": [
+                {"source": "kb_test:c1", "target": "kb_test:e1", "rank": 0, "entity": "kb_test:e1"}
+            ],
+            'kind == "Chunk"': [{"vid": "kb_test:c1"}],
+        }
+    )
+    restored = [{"entity_id": "e9", "name": "梨", "attributes": {"来源": "旧文件"}, "source_chunk_id": "c9"}]
+
+    service._delete_file_graph_from_graph("kb_test", "file_1", None, restored_entities=restored)
+
+    joined = "\n".join(connection.statements)
+    assert 'DELETE VERTEX "kb_test:e1" WITH EDGE' in joined
+    assert 'UPDATE VERTEX ON Node "kb_test:e9" SET Node.name = "梨"' in joined
+    assert 'Node.attributes = "{\\"来源\\": \\"旧文件\\"}"' in joined
+
+
+def test_delete_graph_skips_lookup_when_no_vertex():
+    service, connection = _service({"RETURN count(n) AS c": [{"c": 0}]})
+    service.graph_vector_store = SimpleNamespace(drop_graph_collections=MagicMock())
+
+    service.delete_graph("kb_test")
+
+    assert connection.statements == []
+    service.graph_vector_store.drop_graph_collections.assert_called_once_with("kb_test")
+
+
+def test_delete_graph_removes_all_vertices_with_edges():
+    service, connection = _service({"RETURN count(n) AS c": [{"c": 3}]})
+    service.graph_vector_store = SimpleNamespace(drop_graph_collections=MagicMock())
+
+    service.delete_graph("kb_test")
+
+    assert connection.statements == [
+        'LOOKUP ON Node WHERE Node.kb_id == "kb_test" YIELD id(vertex) AS vid | DELETE VERTEX $-.vid WITH EDGE'
+    ]
+
+
+def test_get_stats_reads_counts_and_entity_labels():
+    service, _ = _service(
+        {
+            "RETURN count(n) AS node_count": [{"node_count": 12}],
+            "RETURN count(r) AS edge_count": [{"edge_count": 30}],
+            "RETURN n.Node.label AS entity_label": [
+                {"entity_label": "人物", "count": 7},
+                {"entity_label": "组织", "count": 2},
+            ],
+        }
+    )
+
+    stats = service._get_stats_sync('"kb_test"')
+
+    assert stats == {
+        "total_nodes": 12,
+        "total_edges": 30,
+        "entity_types": [{"type": "人物", "count": 7}, {"type": "组织", "count": 2}],
+    }
 
 
 @pytest.mark.asyncio
@@ -279,7 +317,7 @@ async def test_delete_file_graph_initializes_vector_store_outside_event_loop(mon
     )
     service._file_graph_record_ids = lambda *args: ([], [])
     deleted = []
-    service._delete_file_graph_from_neo4j = lambda *args: deleted.append(args)
+    service._delete_file_graph_from_graph = lambda *args: deleted.append(args)
     await service.delete_file_graph("kb-1", "file-1", generation=2)
     assert initialized_threads and initialized_threads[0] != loop_thread
     store.delete_graph_records.assert_awaited_once_with("kb-1", entity_ids=["entity-1"], triple_ids=["triple-1"])

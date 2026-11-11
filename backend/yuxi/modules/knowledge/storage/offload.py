@@ -32,4 +32,4 @@ class BoundedOffload:
 
 
 run_milvus_query_io = BoundedOffload(8)
-run_neo4j_query_io = BoundedOffload(8)
+run_nebula_query_io = BoundedOffload(8)

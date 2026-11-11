@@ -113,7 +113,7 @@ def test_production_generates_credentials_and_requires_cube_address(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     values = read_env(tmp_path)
-    for name in ["POSTGRES_PASSWORD", "NEO4J_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY"]:
+    for name in ["POSTGRES_PASSWORD", "NEBULA_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY"]:
         assert len(values[name]) >= 32
     assert values["YUXI_ENV"] == "production"
     assert values["SANDBOX_BACKEND"] == "cube"

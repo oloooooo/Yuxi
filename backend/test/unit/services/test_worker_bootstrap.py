@@ -13,7 +13,7 @@ from yuxi.modules.system.services import options as option_values
 def api_key_derivation_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("yuxi.modules.agents.runtime.sandbox.check_sandbox_provider", AsyncMock())
     monkeypatch.setattr("yuxi.modules.knowledge.runtime.knowledge_base.initialize", AsyncMock())
-    monkeypatch.setattr("yuxi.infrastructure.neo4j.get_shared_neo4j_connection", lambda: None)
+    monkeypatch.setattr("yuxi.infrastructure.nebula.get_shared_nebula_connection", lambda: None)
     monkeypatch.setenv("JWT_SECRET_KEY", "test-jwt-secret-that-is-at-least-32-chars")
     monkeypatch.setenv("YUXI_INSTANCE_ID", "worker-startup-test")
     monkeypatch.setenv("API_KEY_DERIVATION_SECRET", "test-api-key-derivation-secret-32-chars")
@@ -123,12 +123,12 @@ async def test_worker_shutdown_closes_queue_clients_before_postgres(monkeypatch:
         calls.append("postgres")
 
     monkeypatch.setattr("yuxi.infrastructure.redis.queue.close_queue_clients", fake_close_queue_clients)
-    monkeypatch.setattr("yuxi.infrastructure.neo4j.close_shared_neo4j_connection", lambda: calls.append("neo4j"))
+    monkeypatch.setattr("yuxi.infrastructure.nebula.close_shared_nebula_connection", lambda: calls.append("nebula"))
     monkeypatch.setattr(worker_bootstrap.pg_manager, "close", fake_close_postgres)
 
     await worker_bootstrap.shutdown({worker_bootstrap._RECONCILIATION_TASK_KEY: reconciliation_job})
 
-    assert calls == ["redis", "neo4j", "postgres"]
+    assert calls == ["redis", "nebula", "postgres"]
     assert reconciliation_job.cancelled()
 
 

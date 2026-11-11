@@ -1,4 +1,4 @@
-"""单文件图谱构建的真实 PostgreSQL、Neo4j 与 worker 装配契约。"""
+"""单文件图谱构建的真实 PostgreSQL、图库与 worker 装配契约。"""
 
 import asyncio
 from types import SimpleNamespace
@@ -10,12 +10,13 @@ from sqlalchemy import insert, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from test.integration.graphs.nebula_graph import drop_kb
 from test.integration.support.postgres_schema import create_isolated_manager, drop_isolated_schema
-from yuxi.infrastructure.neo4j import safe_neo4j_label
 from yuxi.migrations.schema import create_knowledge_tables
 from yuxi.modules.knowledge.graphs import service as graph_service
 from yuxi.modules.knowledge.graphs.extractors import normalize_extraction_result
 from yuxi.modules.knowledge.graphs.service import KnowledgeGraphService
+from yuxi.infrastructure.nebula import get_shared_nebula_connection
 from yuxi.modules.knowledge.models import KnowledgeChunk
 from yuxi.modules.knowledge.repositories import bases, chunks, graphs, projections
 from yuxi.modules.knowledge.services import background_jobs
@@ -28,7 +29,6 @@ async def test_worker_builds_only_selected_file_with_shared_entities(monkeypatch
     schema, admin, engine, manager = await create_isolated_manager("pytest_file_graph_build")
     manager.AsyncSession = async_sessionmaker(engine, expire_on_commit=False)
     kb_id = f"pytest_file_build_{uuid4().hex}"
-    label = safe_neo4j_label(kb_id)
     for module in (bases, chunks, graphs, projections):
         monkeypatch.setattr(module, "pg_manager", manager)
     vector_store = SimpleNamespace(upsert_graph_records=AsyncMock())
@@ -169,6 +169,5 @@ async def test_worker_builds_only_selected_file_with_shared_entities(monkeypatch
         with pytest.raises((ValueError, RuntimeError), match="代次|文件"):
             await background_jobs.run_knowledge_graph(context)
     finally:
-        with service.driver.session() as session:
-            session.run(f"MATCH (n:MilvusKB:`{label}`) DETACH DELETE n").consume()
+        drop_kb(get_shared_nebula_connection(), kb_id)
         await drop_isolated_schema(schema, admin, engine)
